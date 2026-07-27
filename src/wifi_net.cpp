@@ -15,6 +15,8 @@ uint32_t beginMs = 0;
 // config UI stays reachable (e.g. after a bad SSID/password was saved).
 constexpr uint32_t AP_FALLBACK_MS = 30000;
 constexpr const char* AP_SSID = "ESP32-MIDI-Setup";
+// WPA2 minimum is 8 chars; "midi" alone is rejected by softAP()
+constexpr const char* AP_PASSWORD = "midimidi";
 
 void startMdns() {
     if (mdnsUp) return;
@@ -72,7 +74,7 @@ void WifiNet::tick() {
         millis() - beginMs > AP_FALLBACK_MS) {
         apActive = true;
         WiFi.mode(WIFI_AP_STA);  // keep retrying the station side
-        WiFi.softAP(AP_SSID);
+        WiFi.softAP(AP_SSID, AP_PASSWORD);
         StatusLed::set(LedStatus::PortalActive);
         Serial.printf("[net] station connect timed out; setup AP \"%s\" up at %s\n",
                       AP_SSID, WiFi.softAPIP().toString().c_str());

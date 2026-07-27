@@ -4,6 +4,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 
+#include "boot_guard.h"
 #include "config.h"
 #include "rtp_midi.h"
 
@@ -80,6 +81,7 @@ void handleConfigPost() {
                 ok ? "<meta http-equiv='refresh' content='8;url=/'>Saved. Rebooting..."
                    : "Failed to save config");
     if (ok) {
+        BootGuard::markStable();
         delay(300);
         ESP.restart();
     }
@@ -91,6 +93,7 @@ void handleUpdatePost() {
                 ok ? "<meta http-equiv='refresh' content='12;url=/'>Flashed. Rebooting..."
                    : String("Update failed: ") + Update.errorString());
     if (ok) {
+        BootGuard::markStable();
         delay(300);
         ESP.restart();
     }
@@ -123,6 +126,8 @@ void WebUi::begin() {
     server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
     server.begin();
     Serial.println("[web] config UI on http://esp32-midi.local/");
+    // NOTE: no auth on config or /update -- anyone on the LAN can reflash.
+    // Acceptable for a home network; revisit if that changes.
 }
 
 void WebUi::tick() {

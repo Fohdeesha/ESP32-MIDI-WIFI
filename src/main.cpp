@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+#include "boot_guard.h"
 #include "config.h"
 #include "rtp_midi.h"
 #include "status_led.h"
@@ -15,6 +16,7 @@ static const char* HOSTNAME = "esp32-midi";
 
 void setup() {
     Serial.begin(115200);
+    BootGuard::begin();
     delay(500);
     Serial.println();
     Serial.println("ESP32-MIDI-WIFI v" FW_VERSION);
@@ -36,6 +38,7 @@ void loop() {
     }
     RtpMidi::tick();
     WebUi::tick();
+    BootGuard::tick();
 
     delay(1);
 }
