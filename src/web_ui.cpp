@@ -33,9 +33,13 @@ label{display:block;margin:.7em 0 .2em;color:#aaa}
 input[type=text],input[type=password],input[type=number]{width:100%;box-sizing:border-box;padding:.45em;background:#222;border:1px solid #444;border-radius:4px;color:#ddd}
 button{margin-top:1em;padding:.5em 1.4em;background:#2a6;border:0;border-radius:4px;color:#fff;font-size:1em;cursor:pointer}
 .warn{color:#fa5}small{color:#888}
-.ssids{display:flex;flex-wrap:wrap;gap:.4em;margin:.5em 0}
-.ssids a{background:#222;border:1px solid #444;border-radius:4px;padding:.25em .6em;color:#8cf;text-decoration:none;font-size:.9em}
-.ssids a:hover{border-color:#2a6}
+.nets{margin:.5em 0;border:1px solid #333;border-radius:4px;padding:.2em .6em}
+.nets summary{cursor:pointer;color:#8cf;padding:.3em 0}
+.nets table{width:100%;border-collapse:collapse;margin:.2em 0 .4em}
+.nets tr{cursor:pointer}
+.nets tr:hover td{background:#222}
+.nets td{padding:.35em .6em;border-bottom:1px solid #2a2a2a;color:#ddd}
+.nets td.rssi{text-align:right;color:#888;white-space:nowrap;width:6em}
 </style></head><body><h1>ESP32-MIDI-WIFI</h1>
 )html";
 
@@ -86,16 +90,23 @@ String ssidChips() {
             }
             order[j + 1] = k;
         }
-        out += F("<div class='ssids'>");
+        String rows;
+        int count = 0;
         for (int i = 0; i < n; i++) {
             String s = WiFi.SSID(order[i]);
             if (!s.length()) continue;
             String esc = htmlEscape(s);
-            if (out.indexOf(">" + esc + " <") >= 0) continue;  // dedupe
-            out += "<a href='#' onclick=\"document.forms[0].ssid.value=this.dataset.s;return false\" data-s='" +
-                   esc + "'>" + esc + " <small>" + String(WiFi.RSSI(order[i])) + "</small></a>";
+            if (rows.indexOf("'>" + esc + "</td>") >= 0) continue;  // dedupe
+            rows += "<tr onclick=\"document.forms[0].ssid.value=this.dataset.s\" data-s='" + esc +
+                    "'><td class='net'>" + esc + "</td><td class='rssi'>" +
+                    String(WiFi.RSSI(order[i])) + " dBm</td></tr>";
+            count++;
         }
-        out += F("</div>");
+        out += F("<details class='nets'><summary>Available networks (");
+        out += String(count);
+        out += F(")</summary><table>");
+        out += rows;
+        out += F("</table></details>");
     } else if (n == 0) {
         out = F("<p><small>No networks found yet -- reload to rescan.</small></p>");
     } else {
@@ -112,7 +123,7 @@ void handleRoot() {
     String page = FPSTR(PAGE_HEAD);
     page += statusSection();
     page += F("<h2>Configuration</h2><form method='POST' action='/config' autocomplete='off'>"
-              "<label>WiFi SSID <small>(type, or click a nearby network below)</small></label>"
+              "<label>WiFi SSID <small>(type, or pick from available networks below)</small></label>"
               "<input type='text' name='ssid' autocomplete='off' value='");
     page += htmlEscape(c.wifiSsid);
     page += F("'>");
