@@ -14,6 +14,14 @@
 
 namespace {
 WebServer server(80);
+bool uploadAuthorized = false;
+
+// "" = protection off. Basic auth, fixed username "admin". LAN-grade only.
+bool authOk() {
+    const String& p = Config::get().webPass;
+    if (p.length() == 0) return true;
+    return server.authenticate("admin", p.c_str());
+}
 
 const char PAGE_HEAD[] PROGMEM = R"html(<!DOCTYPE html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -41,6 +49,7 @@ String statusSection() {
 }
 
 void handleRoot() {
+    if (!authOk()) return server.requestAuthentication();
     const Config::Values& c = Config::get();
     String page = FPSTR(PAGE_HEAD);
     page += statusSection();
@@ -56,17 +65,28 @@ void handleRoot() {
     page += c.targetIp;
     page += F("'><label>Peer port</label><input type='number' name='tport' min='1' max='65535' value='");
     page += String(c.targetPort);
-    page += F("'><button type='submit'>Save &amp; reboot</button></form>"
+    page += F("'><label>Web UI password <small>(");
+    page += c.webPass.length() ? F("set; blank = keep current") : F("not set; blank = stays off");
+    page += F(")</small></label><input type='password' name='webpass' maxlength='63' value=''>"
+              "<label><input type='checkbox' name='clearpass' value='1'> Remove web UI password</label>"
+              "<button type='submit'>Save &amp; reboot</button></form>"
               "<h2>Firmware update</h2>"
               "<form method='POST' action='/update' enctype='multipart/form-data'>"
               "<input type='file' name='fw' accept='.bin'>"
               "<button type='submit'>Upload &amp; flash</button></form>"
-              "<p><small>Device reboots after saving config or flashing firmware.</small></p>"
+              "<h2>Factory reset</h2>"
+              "<form method='POST' action='/reset' "
+              "onsubmit=\"return confirm('Erase all settings and reboot?')\">"
+              "<button type='submit'>Reset to defaults</button></form>"
+              "<p><small>Also available without the password: hold the BOOT button "
+              "for 10 seconds.</small></p>"
+              "<p><small>Device reboots after saving config, flashing firmware, or resetting.</small></p>"
               "</body></html>");
     server.send(200, "text/html", page);
 }
 
 void handleConfigPost() {
+    if (!authOk()) return server.requestAuthentication();
     Config::Values v = Config::get();
     if (server.hasArg("ssid") && server.arg("ssid").length()) v.wifiSsid = server.arg("ssid");
     if (server.hasArg("pass") && server.arg("pass").length()) v.wifiPass = server.arg("pass");
@@ -75,6 +95,11 @@ void handleConfigPost() {
     if (server.hasArg("tport")) {
         long p = server.arg("tport").toInt();
         if (p >= 1 && p <= 65535) v.targetPort = (uint16_t)p;
+    }
+    if (server.hasArg("clearpass") && server.arg("clearpass") == "1") {
+        v.webPass = "";
+    } else if (server.hasArg("webpass") && server.arg("webpass").length()) {
+        v.webPass = server.arg("webpass");
     }
     bool ok = Config::save(v);
     server.send(ok ? 200 : 500, "text/html",
@@ -88,6 +113,11 @@ void handleConfigPost() {
 }
 
 void handleUpdatePost() {
+    if (!authOk()) return server.requestAuthentication();
+    if (!uploadAuthorized) {
+        server.send(401, "text/plain", "unauthorized");
+        return;
+    }
     bool ok = !Update.hasError();
     server.send(ok ? 200 : 500, "text/html",
                 ok ? "<meta http-equiv='refresh' content='12;url=/'>Flashed. Rebooting..."
@@ -102,11 +132,20 @@ void handleUpdatePost() {
 void handleUpdateUpload() {
     HTTPUpload& up = server.upload();
     if (up.status == UPLOAD_FILE_START) {
+        // Gate the flash write itself, not just the completion response --
+        // otherwise an unauthenticated POST would still reach the OTA slot.
+        uploadAuthorized = authOk();
+        if (!uploadAuthorized) {
+            Serial.println("[web] unauthorized firmware upload rejected");
+            return;
+        }
         Serial.printf("[web] firmware upload start: %s\n", up.filename.c_str());
         Update.begin(UPDATE_SIZE_UNKNOWN);
     } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (!uploadAuthorized) return;
         Update.write(up.buf, up.currentSize);
     } else if (up.status == UPLOAD_FILE_END) {
+        if (!uploadAuthorized) return;
         if (Update.end(true)) {
             Serial.printf("[web] firmware upload done: %u bytes\n", up.totalSize);
         } else {
@@ -119,15 +158,24 @@ void handleUpdateUpload() {
 }
 }  // namespace
 
+void handleResetPost() {
+    if (!authOk()) return server.requestAuthentication();
+    Serial.println("[web] factory reset requested");
+    server.send(200, "text/html",
+                "<meta http-equiv='refresh' content='10;url=/'>Settings erased. Rebooting...");
+    Config::wipeAll();
+    delay(300);
+    ESP.restart();
+}
+
 void WebUi::begin() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/config", HTTP_POST, handleConfigPost);
     server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
+    server.on("/reset", HTTP_POST, handleResetPost);
     server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
     server.begin();
     Serial.println("[web] config UI on http://esp32-midi.local/");
-    // NOTE: no auth on config or /update -- anyone on the LAN can reflash.
-    // Acceptable for a home network; revisit if that changes.
 }
 
 void WebUi::tick() {
