@@ -5,6 +5,7 @@ enum class LedStatus {
     WifiConnecting,  // blinking blue
     WifiConnected,   // solid green
     SessionActive,   // solid cyan — RTP-MIDI peer connected
+    PortalActive,    // blinking magenta — setup AP / config portal
     Error,           // solid red
 };
 

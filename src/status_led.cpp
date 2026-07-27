@@ -25,6 +25,9 @@ void apply() {
         case LedStatus::SessionActive:
             neopixelWrite(LED_PIN, 0, BRIGHTNESS, BRIGHTNESS);
             break;
+        case LedStatus::PortalActive:
+            neopixelWrite(LED_PIN, blinkOn ? BRIGHTNESS : 0, 0, blinkOn ? BRIGHTNESS : 0);
+            break;
         case LedStatus::Error:
             neopixelWrite(LED_PIN, BRIGHTNESS, 0, 0);
             break;
@@ -44,7 +47,7 @@ void StatusLed::set(LedStatus status) {
 }
 
 void StatusLed::tick() {
-    if (current != LedStatus::WifiConnecting) return;
+    if (current != LedStatus::WifiConnecting && current != LedStatus::PortalActive) return;
     uint32_t now = millis();
     if (now - lastBlink >= BLINK_INTERVAL_MS) {
         lastBlink = now;

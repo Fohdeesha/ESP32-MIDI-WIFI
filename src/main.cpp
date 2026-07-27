@@ -1,8 +1,9 @@
 #include <Arduino.h>
 
+#include "config.h"
 #include "rtp_midi.h"
-#include "secrets.h"
 #include "status_led.h"
+#include "web_ui.h"
 #include "wifi_net.h"
 
 #ifndef FW_VERSION
@@ -20,7 +21,9 @@ void setup() {
     Serial.println("USB MIDI -> RTP-MIDI wireless bridge");
 
     StatusLed::begin();
-    WifiNet::begin(WIFI_SSID, WIFI_PASSWORD, HOSTNAME);
+    Config::load();
+    WifiNet::begin(Config::get().wifiSsid.c_str(), Config::get().wifiPass.c_str(), HOSTNAME);
+    WebUi::begin();
 }
 
 void loop() {
@@ -32,6 +35,7 @@ void loop() {
         RtpMidi::begin();
     }
     RtpMidi::tick();
+    WebUi::tick();
 
     delay(1);
 }

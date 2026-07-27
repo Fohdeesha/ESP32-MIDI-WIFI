@@ -1,19 +1,20 @@
-#include "rtp_midi.h"
+﻿#include "rtp_midi.h"
 
 #include <Arduino.h>
 #include <AppleMIDI.h>
 #include <WiFi.h>
 
+#include "config.h"
 #include "secrets.h"
 #include "status_led.h"
 
 // Defines global session + MIDI interface objects (AppleMIDI, MIDI).
-// Must appear in exactly one translation unit — keep it in this .cpp only.
+// Must appear in exactly one translation unit -- keep it in this .cpp only.
 APPLEMIDI_CREATE_INSTANCE(WiFiUDP, MIDI, RTPMIDI_SESSION_NAME, 5004);
 
 namespace {
 bool started = false;
-int peerCount = 0;
+int s_peerCount = 0;
 
 #ifdef RTP_TEST_NOTES
 // Short arpeggio sent when a peer connects, so the session can be verified
@@ -25,7 +26,7 @@ int arpStep = -1;  // -1 = idle; even = note on, odd = note off
 uint32_t arpLastMs = 0;
 
 void arpeggioTick() {
-    if (arpStep < 0 || peerCount == 0) return;
+    if (arpStep < 0 || s_peerCount == 0) return;
     uint32_t now = millis();
     if (now - arpLastMs < ARP_STEP_MS) return;
     arpLastMs = now;
@@ -45,9 +46,9 @@ void arpeggioTick() {
 #endif
 
 void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/, const char* name) {
-    peerCount++;
+    s_peerCount++;
     Serial.printf("[rtp] peer connected: \"%s\" (peers: %d)\n",
-                  (name && name[0]) ? name : "?", peerCount);
+                  (name && name[0]) ? name : "?", s_peerCount);
     StatusLed::set(LedStatus::SessionActive);
 #ifdef RTP_TEST_NOTES
     arpStep = 0;
@@ -56,19 +57,21 @@ void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/, const char* na
 }
 
 void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/) {
-    if (peerCount > 0) peerCount--;
-    Serial.printf("[rtp] peer disconnected (peers: %d)\n", peerCount);
-    if (peerCount == 0) StatusLed::set(LedStatus::WifiConnected);
+    if (s_peerCount > 0) s_peerCount--;
+    Serial.printf("[rtp] peer disconnected (peers: %d)\n", s_peerCount);
+    if (s_peerCount == 0) StatusLed::set(LedStatus::WifiConnected);
 }
 }  // namespace
 
 void RtpMidi::begin() {
     if (started) return;
+    AppleMIDI.setName(Config::get().sessionName.c_str());
     AppleMIDI.setHandleConnected(onPeerConnected);
     AppleMIDI.setHandleDisconnected(onPeerDisconnected);
     MIDI.begin(MIDI_CHANNEL_OMNI);
     started = true;
-    Serial.printf("[rtp] session \"%s\" listening on UDP 5004/5005\n", RTPMIDI_SESSION_NAME);
+    Serial.printf("[rtp] session \"%s\" listening on UDP 5004/5005\n",
+                  Config::get().sessionName.c_str());
 }
 
 bool RtpMidi::isStarted() {
@@ -84,13 +87,17 @@ void RtpMidi::tick() {
 }
 
 bool RtpMidi::hasPeer() {
-    return peerCount > 0;
+    return s_peerCount > 0;
+}
+
+int RtpMidi::peerCount() {
+    return s_peerCount;
 }
 
 void RtpMidi::sendNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
-    if (started && peerCount > 0) MIDI.sendNoteOn(note, velocity, channel);
+    if (started && s_peerCount > 0) MIDI.sendNoteOn(note, velocity, channel);
 }
 
 void RtpMidi::sendNoteOff(uint8_t channel, uint8_t note, uint8_t velocity) {
-    if (started && peerCount > 0) MIDI.sendNoteOff(note, velocity, channel);
+    if (started && s_peerCount > 0) MIDI.sendNoteOff(note, velocity, channel);
 }

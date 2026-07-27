@@ -6,7 +6,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 (AppleMIDI, RFC 6295), so it shows up in macOS, Windows (rtpMIDI), and Linux as
 a standard network MIDI session.
 
-**Current version: 0.3.0**
+**Current version: 0.4.0**
 
 ## How it works
 
@@ -51,6 +51,8 @@ pio device monitor       # serial console, 115200 baud
 - [x] 0.1.0 — project skeleton: builds, boots, prints version
 - [x] 0.2.0 — WiFi station connect + mDNS advertisement + WS2812 status LED
 - [x] 0.3.0 — RTP-MIDI session established, test notes sent
-- [ ] 0.4.0 — USB host: enumerate USB MIDI device, parse MIDI-over-USB packets
-- [ ] 0.5.0 — full bridge: USB MIDI in → RTP-MIDI out
-- [ ] 0.6.0 — reverse direction (RTP-MIDI in → USB MIDI out)
+- [x] 0.4.0 — web config UI + OTA firmware updates + setup-AP fallback
+- [ ] 0.5.0 — USB host: enumerate USB MIDI device, parse MIDI-over-USB packets
+- [ ] 0.6.0 — full bridge: USB MIDI in → RTP-MIDI out
+- [ ] 0.7.0 — reverse direction (RTP-MIDI in → USB MIDI out)
+- [ ] 0.8.0 — session initiator mode (invite a configured peer by IP:port)
