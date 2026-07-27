@@ -48,15 +48,54 @@ String statusSection() {
     return s;
 }
 
+String htmlEscape(const String& in) {
+    String out;
+    out.reserve(in.length());
+    for (size_t i = 0; i < in.length(); i++) {
+        switch (in[i]) {
+            case '&': out += F("&amp;"); break;
+            case '<': out += F("&lt;"); break;
+            case '>': out += F("&gt;"); break;
+            case '\'': out += F("&#39;"); break;
+            case '"': out += F("&quot;"); break;
+            default: out += in[i];
+        }
+    }
+    return out;
+}
+
+// Serves the previous async scan's results and kicks off a fresh scan, so
+// the list is at most one page-load stale. First-ever load shows none.
+String ssidDatalist() {
+    String opts;
+    int n = WiFi.scanComplete();
+    if (n >= 0) {
+        for (int i = 0; i < n; i++) {
+            String s = WiFi.SSID(i);
+            if (!s.length()) continue;
+            String esc = htmlEscape(s);
+            if (opts.indexOf("'" + esc + "'") >= 0) continue;  // dedupe
+            opts += "<option value='" + esc + "'>";
+        }
+        WiFi.scanDelete();
+    }
+    WiFi.scanNetworks(true);
+    return "<datalist id='ssids'>" + opts + "</datalist>";
+}
+
 void handleRoot() {
     if (!authOk()) return server.requestAuthentication();
     const Config::Values& c = Config::get();
     String page = FPSTR(PAGE_HEAD);
     page += statusSection();
     page += F("<h2>Configuration</h2><form method='POST' action='/config'>"
-              "<label>WiFi SSID</label><input type='text' name='ssid' value='");
-    page += c.wifiSsid;
-    page += F("'><label>WiFi password <small>(leave blank to keep current)</small></label>"
+              "<label>WiFi SSID <small>(pick from nearby networks or type; "
+              "reload to refresh the list)</small></label>"
+              "<input type='text' name='ssid' list='ssids' value='");
+    page += htmlEscape(c.wifiSsid);
+    page += F("'>");
+    page += ssidDatalist();
+    page += F("<label>WiFi password <small>(leave blank to keep current)</small></label>"
               "<input type='password' name='pass' value=''>"
               "<label>RTP-MIDI session name</label><input type='text' name='name' maxlength='24' value='");
     page += c.sessionName;

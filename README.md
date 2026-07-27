@@ -6,7 +6,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 (AppleMIDI, RFC 6295), so it shows up in macOS, Windows (rtpMIDI), and Linux as
 a standard network MIDI session.
 
-**Current version: 0.4.3**
+**Current version: 0.4.4**
 
 ## How it works
 
@@ -52,11 +52,13 @@ factory reset) the device opens a WiFi access point:
 
 - **SSID:** `ESP32-MIDI-Setup` · **password:** `midimidi`
 - Join it and browse to `http://192.168.4.1`
+- Log in with the default credentials: username **admin**, password **midimidi**
+  (changeable or removable on the config page)
 - Enter your WiFi credentials and save; the device reboots onto your network
   and is reachable at `http://esp32-midi.local/`
 
-The web UI also provides status, RTP-MIDI settings, an optional access
-password, over-the-air firmware updates, and factory reset (also triggered
+The web UI also provides status, RTP-MIDI settings, access-password
+management, over-the-air firmware updates, and factory reset (also triggered
 by holding the BOOT button for 10 seconds). If the configured network is
 unreachable for 30 seconds, the setup AP reopens automatically.
 

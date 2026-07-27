@@ -16,7 +16,9 @@ void Config::load() {
     values.sessionName = prefs.getString("name", "ESP32-MIDI");
     values.targetIp = prefs.getString("tip", "");
     values.targetPort = prefs.getUShort("tport", 5004);
-    values.webPass = prefs.getString("wpass", "");
+    // Default login is admin/midimidi (documented in the README, not a secret).
+    // A stored empty string means the user explicitly removed protection.
+    values.webPass = prefs.getString("wpass", "midimidi");
     prefs.end();
 }
 
