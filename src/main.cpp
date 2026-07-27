@@ -1,5 +1,6 @@
 #include <Arduino.h>
 
+#include "rtp_midi.h"
 #include "secrets.h"
 #include "status_led.h"
 #include "wifi_net.h"
@@ -25,5 +26,12 @@ void setup() {
 void loop() {
     StatusLed::tick();
     WifiNet::tick();
-    delay(10);
+
+    // AppleMIDI needs live sockets, so the session starts on first connect.
+    if (!RtpMidi::isStarted() && WifiNet::isConnected()) {
+        RtpMidi::begin();
+    }
+    RtpMidi::tick();
+
+    delay(1);
 }

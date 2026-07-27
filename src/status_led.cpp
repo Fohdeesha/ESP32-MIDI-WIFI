@@ -22,6 +22,9 @@ void apply() {
         case LedStatus::WifiConnected:
             neopixelWrite(LED_PIN, 0, BRIGHTNESS, 0);
             break;
+        case LedStatus::SessionActive:
+            neopixelWrite(LED_PIN, 0, BRIGHTNESS, BRIGHTNESS);
+            break;
         case LedStatus::Error:
             neopixelWrite(LED_PIN, BRIGHTNESS, 0, 0);
             break;

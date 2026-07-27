@@ -4,6 +4,7 @@ enum class LedStatus {
     Boot,            // dim white
     WifiConnecting,  // blinking blue
     WifiConnected,   // solid green
+    SessionActive,   // solid cyan — RTP-MIDI peer connected
     Error,           // solid red
 };
 
