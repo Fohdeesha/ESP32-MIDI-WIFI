@@ -33,6 +33,9 @@ label{display:block;margin:.7em 0 .2em;color:#aaa}
 input[type=text],input[type=password],input[type=number]{width:100%;box-sizing:border-box;padding:.45em;background:#222;border:1px solid #444;border-radius:4px;color:#ddd}
 button{margin-top:1em;padding:.5em 1.4em;background:#2a6;border:0;border-radius:4px;color:#fff;font-size:1em;cursor:pointer}
 .warn{color:#fa5}small{color:#888}
+.ssids{display:flex;flex-wrap:wrap;gap:.4em;margin:.5em 0}
+.ssids a{background:#222;border:1px solid #444;border-radius:4px;padding:.25em .6em;color:#8cf;text-decoration:none;font-size:.9em}
+.ssids a:hover{border-color:#2a6}
 </style></head><body><h1>ESP32-MIDI-WIFI</h1>
 )html";
 
@@ -65,22 +68,42 @@ String htmlEscape(const String& in) {
 }
 
 // Serves the previous async scan's results and kicks off a fresh scan, so
-// the list is at most one page-load stale. First-ever load shows none.
-String ssidDatalist() {
-    String opts;
+// the list is at most one page-load stale. Rendered as clickable chips that
+// fill the SSID input -- a <datalist> gets suppressed by browser password
+// managers on forms that contain password fields.
+String ssidChips() {
+    String out;
     int n = WiFi.scanComplete();
-    if (n >= 0) {
+    if (n > 0) {
+        int order[64];
+        if (n > 64) n = 64;
+        for (int i = 0; i < n; i++) order[i] = i;
+        for (int i = 1; i < n; i++) {  // insertion sort by RSSI, strongest first
+            int k = order[i], j = i - 1;
+            while (j >= 0 && WiFi.RSSI(order[j]) < WiFi.RSSI(k)) {
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = k;
+        }
+        out += F("<div class='ssids'>");
         for (int i = 0; i < n; i++) {
-            String s = WiFi.SSID(i);
+            String s = WiFi.SSID(order[i]);
             if (!s.length()) continue;
             String esc = htmlEscape(s);
-            if (opts.indexOf("'" + esc + "'") >= 0) continue;  // dedupe
-            opts += "<option value='" + esc + "'>";
+            if (out.indexOf(">" + esc + " <") >= 0) continue;  // dedupe
+            out += "<a href='#' onclick=\"document.forms[0].ssid.value=this.dataset.s;return false\" data-s='" +
+                   esc + "'>" + esc + " <small>" + String(WiFi.RSSI(order[i])) + "</small></a>";
         }
-        WiFi.scanDelete();
+        out += F("</div>");
+    } else if (n == 0) {
+        out = F("<p><small>No networks found yet -- reload to rescan.</small></p>");
+    } else {
+        out = F("<p><small>Scanning for networks... reload in a few seconds.</small></p>");
     }
+    if (n >= 0) WiFi.scanDelete();
     WiFi.scanNetworks(true);
-    return "<datalist id='ssids'>" + opts + "</datalist>";
+    return out;
 }
 
 void handleRoot() {
@@ -88,13 +111,12 @@ void handleRoot() {
     const Config::Values& c = Config::get();
     String page = FPSTR(PAGE_HEAD);
     page += statusSection();
-    page += F("<h2>Configuration</h2><form method='POST' action='/config'>"
-              "<label>WiFi SSID <small>(pick from nearby networks or type; "
-              "reload to refresh the list)</small></label>"
-              "<input type='text' name='ssid' list='ssids' value='");
+    page += F("<h2>Configuration</h2><form method='POST' action='/config' autocomplete='off'>"
+              "<label>WiFi SSID <small>(type, or click a nearby network below)</small></label>"
+              "<input type='text' name='ssid' autocomplete='off' value='");
     page += htmlEscape(c.wifiSsid);
     page += F("'>");
-    page += ssidDatalist();
+    page += ssidChips();
     page += F("<label>WiFi password <small>(leave blank to keep current)</small></label>"
               "<input type='password' name='pass' value=''>"
               "<label>RTP-MIDI session name</label><input type='text' name='name' maxlength='24' value='");
