@@ -5,12 +5,12 @@
 #include <WiFi.h>
 
 #include "config.h"
-#include "secrets.h"
 #include "status_led.h"
 
 // Defines global session + MIDI interface objects (AppleMIDI, MIDI).
 // Must appear in exactly one translation unit -- keep it in this .cpp only.
-APPLEMIDI_CREATE_INSTANCE(WiFiUDP, MIDI, RTPMIDI_SESSION_NAME, 5004);
+// The name here is a placeholder; begin() sets the configured name.
+APPLEMIDI_CREATE_INSTANCE(WiFiUDP, MIDI, "ESP32-MIDI", 5004);
 
 namespace {
 bool started = false;

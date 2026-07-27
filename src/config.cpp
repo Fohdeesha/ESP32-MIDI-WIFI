@@ -2,18 +2,18 @@
 
 #include <Preferences.h>
 
-#include "secrets.h"
-
 namespace {
 Config::Values values;
 Preferences prefs;
 }  // namespace
 
 void Config::load() {
+    // No baked-in credentials: an unconfigured device (empty SSID) opens the
+    // setup AP portal instead of joining a network.
     prefs.begin("midicfg", false);  // read-write so first boot creates the namespace
-    values.wifiSsid = prefs.getString("ssid", WIFI_SSID);
-    values.wifiPass = prefs.getString("pass", WIFI_PASSWORD);
-    values.sessionName = prefs.getString("name", RTPMIDI_SESSION_NAME);
+    values.wifiSsid = prefs.getString("ssid", "");
+    values.wifiPass = prefs.getString("pass", "");
+    values.sessionName = prefs.getString("name", "ESP32-MIDI");
     values.targetIp = prefs.getString("tip", "");
     values.targetPort = prefs.getUShort("tport", 5004);
     values.webPass = prefs.getString("wpass", "");

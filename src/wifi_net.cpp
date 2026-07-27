@@ -30,6 +30,16 @@ void startMdns() {
     Serial.printf("[net] mDNS up: %s.local\n", s_hostname);
 }
 
+void startPortal() {
+    if (apActive) return;
+    apActive = true;
+    WiFi.mode(WIFI_AP_STA);  // keep retrying the station side if configured
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    StatusLed::set(LedStatus::PortalActive);
+    Serial.printf("[net] setup AP \"%s\" up at %s\n",
+                  AP_SSID, WiFi.softAPIP().toString().c_str());
+}
+
 void onWifiEvent(WiFiEvent_t event) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
@@ -56,6 +66,11 @@ void onWifiEvent(WiFiEvent_t event) {
 void WifiNet::begin(const char* ssid, const char* password, const char* hostname) {
     s_hostname = hostname;
     beginMs = millis();
+    if (!ssid || !ssid[0]) {
+        Serial.println("[net] no WiFi configured -- starting setup portal");
+        startPortal();
+        return;
+    }
     StatusLed::set(LedStatus::WifiConnecting);
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname);
@@ -72,12 +87,8 @@ void WifiNet::begin(const char* ssid, const char* password, const char* hostname
 void WifiNet::tick() {
     if (!apActive && WiFi.status() != WL_CONNECTED &&
         millis() - beginMs > AP_FALLBACK_MS) {
-        apActive = true;
-        WiFi.mode(WIFI_AP_STA);  // keep retrying the station side
-        WiFi.softAP(AP_SSID, AP_PASSWORD);
-        StatusLed::set(LedStatus::PortalActive);
-        Serial.printf("[net] station connect timed out; setup AP \"%s\" up at %s\n",
-                      AP_SSID, WiFi.softAPIP().toString().c_str());
+        Serial.println("[net] station connect timed out");
+        startPortal();
     }
 }
 
