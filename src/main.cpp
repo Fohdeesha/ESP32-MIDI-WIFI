@@ -49,7 +49,7 @@ void setup() {
     pinMode(RESET_BTN_PIN, INPUT_PULLUP);
     StatusLed::begin();
     Config::load();
-    WifiNet::begin(Config::get().wifiSsid.c_str(), Config::get().wifiPass.c_str(), HOSTNAME);
+    WifiNet::begin(Config::get(), HOSTNAME);
     WebUi::begin();
     UsbMidi::begin();
 }

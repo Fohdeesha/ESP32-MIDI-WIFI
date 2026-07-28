@@ -19,6 +19,10 @@ void Config::load() {
     // Default login is admin/midimidi (documented in the README, not a secret).
     // A stored empty string means the user explicitly removed protection.
     values.webPass = prefs.getString("wpass", "midimidi");
+    values.staticIp = prefs.getString("sip", "");
+    values.staticMask = prefs.getString("smask", "255.255.255.0");
+    values.staticGw = prefs.getString("sgw", "");
+    values.staticDns = prefs.getString("sdns", "");
     prefs.end();
 }
 
@@ -30,6 +34,10 @@ bool Config::save(const Values& v) {
     prefs.putString("tip", v.targetIp);
     prefs.putUShort("tport", v.targetPort);
     prefs.putString("wpass", v.webPass);
+    prefs.putString("sip", v.staticIp);
+    prefs.putString("smask", v.staticMask);
+    prefs.putString("sgw", v.staticGw);
+    prefs.putString("sdns", v.staticDns);
     prefs.end();
     values = v;
     return true;

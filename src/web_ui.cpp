@@ -9,6 +9,7 @@
 #include "midi_bridge.h"
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
+#include "wifi_net.h"
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.0.0-dev"
@@ -50,7 +51,8 @@ String htmlEscape(const String& in);
 String statusSection() {
     String s = F("<h2>Status</h2><table>");
     s += "<tr><td>Firmware</td><td>v" FW_VERSION "</td></tr>";
-    s += "<tr><td>IP</td><td>" + WiFi.localIP().toString() + "</td></tr>";
+    s += "<tr><td>IP</td><td>" + WiFi.localIP().toString() +
+         (WifiNet::usingStaticIp() ? " (static)" : " (DHCP)") + "</td></tr>";
     s += "<tr><td>RSSI</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
     String peers = String(RtpMidi::peerCount());
     if (Config::get().targetIp.length() && RtpMidi::peerCount() == 0) {
@@ -174,7 +176,21 @@ void handleRoot() {
     page += c.targetIp;
     page += F("'><label>Peer port</label><input type='number' name='tport' min='1' max='65535' value='");
     page += String(c.targetPort);
-    page += F("'><label>Web UI password <small>(");
+    page += F("'><label>Static IP <small>(blank = DHCP)</small></label>"
+              "<input type='text' name='sip' value='");
+    page += htmlEscape(c.staticIp);
+    page += F("'><label>Subnet mask</label><input type='text' name='smask' value='");
+    page += htmlEscape(c.staticMask);
+    page += F("'><label>Gateway <small>(blank = none)</small></label>"
+              "<input type='text' name='sgw' value='");
+    page += htmlEscape(c.staticGw);
+    page += F("'><label>DNS server <small>(blank = use gateway)</small></label>"
+              "<input type='text' name='sdns' value='");
+    page += htmlEscape(c.staticDns);
+    page += F("'><p><small class='warn'>A wrong static IP can make the device unreachable "
+              "(no setup-AP fallback once WiFi itself connects). Recovery: hold BOOT for "
+              "10&nbsp;s to factory-reset.</small></p>"
+              "<label>Web UI password <small>(");
     page += c.webPass.length() ? F("set; blank = keep current") : F("not set; blank = stays off");
     page += F(")</small></label><input type='password' name='webpass' maxlength='63' value=''>"
               "<label><input type='checkbox' name='clearpass' value='1'> Remove web UI password</label>"
@@ -194,6 +210,27 @@ void handleRoot() {
     server.send(200, "text/html", page);
 }
 
+// Valid dotted-quad IPv4, e.g. "192.168.1.81". IPAddress::fromString alone
+// is too lax for validation feedback (it accepts some malformed input on
+// older cores), so require exactly four in-range decimal octets.
+bool validIpv4(const String& s) {
+    int octet = 0, digits = 0, dots = 0;
+    for (size_t i = 0; i < s.length(); i++) {
+        char ch = s[i];
+        if (ch == '.') {
+            if (digits == 0 || ++dots > 3) return false;
+            octet = 0;
+            digits = 0;
+        } else if (ch >= '0' && ch <= '9') {
+            octet = octet * 10 + (ch - '0');
+            if (++digits > 3 || octet > 255) return false;
+        } else {
+            return false;
+        }
+    }
+    return dots == 3 && digits > 0;
+}
+
 void handleConfigPost() {
     if (!authOk()) return server.requestAuthentication();
     Config::Values v = Config::get();
@@ -204,6 +241,30 @@ void handleConfigPost() {
     if (server.hasArg("tport")) {
         long p = server.arg("tport").toInt();
         if (p >= 1 && p <= 65535) v.targetPort = (uint16_t)p;
+    }
+    // Static IP block: validate before saving anything -- a bad value that
+    // slipped into NVS would only surface as an unreachable device.
+    {
+        String err;
+        String sip = server.hasArg("sip") ? server.arg("sip") : v.staticIp;
+        String smask = server.hasArg("smask") ? server.arg("smask") : v.staticMask;
+        String sgw = server.hasArg("sgw") ? server.arg("sgw") : v.staticGw;
+        String sdns = server.hasArg("sdns") ? server.arg("sdns") : v.staticDns;
+        sip.trim(); smask.trim(); sgw.trim(); sdns.trim();
+        if (smask.length() == 0) smask = "255.255.255.0";
+        if (sip.length() && (!validIpv4(sip) || sip == "0.0.0.0")) err = "static IP";
+        else if (!validIpv4(smask)) err = "subnet mask";
+        else if (sgw.length() && !validIpv4(sgw)) err = "gateway";
+        else if (sdns.length() && !validIpv4(sdns)) err = "DNS server";
+        if (err.length()) {
+            server.send(400, "text/html",
+                        "Not saved: invalid " + err + ". Go back and correct it.");
+            return;
+        }
+        v.staticIp = sip;
+        v.staticMask = smask;
+        v.staticGw = sgw;
+        v.staticDns = sdns;
     }
     if (server.hasArg("clearpass") && server.arg("clearpass") == "1") {
         v.webPass = "";
