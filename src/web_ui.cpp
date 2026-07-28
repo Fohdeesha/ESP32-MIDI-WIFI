@@ -33,7 +33,7 @@ body{font-family:system-ui,sans-serif;max-width:640px;margin:1em auto;padding:0 
 h1{font-size:1.3em}h2{font-size:1.05em;margin-top:1.6em;border-bottom:1px solid #333;padding-bottom:.3em}
 table{border-collapse:collapse}td{padding:.15em .8em .15em 0;color:#aaa}td+td{color:#ddd}
 label{display:block;margin:.7em 0 .2em;color:#aaa}
-input[type=text],input[type=password],input[type=number]{width:100%;box-sizing:border-box;padding:.45em;background:#222;border:1px solid #444;border-radius:4px;color:#ddd}
+input[type=text],input[type=password],input[type=number],select{width:100%;box-sizing:border-box;padding:.45em;background:#222;border:1px solid #444;border-radius:4px;color:#ddd}
 button{margin-top:1em;padding:.5em 1.4em;background:#2a6;border:0;border-radius:4px;color:#fff;font-size:1em;cursor:pointer}
 .warn{color:#fa5}small{color:#888}
 .nets{margin:.5em 0;border:1px solid #333;border-radius:4px;padding:.2em .6em}
@@ -48,6 +48,17 @@ button{margin-top:1em;padding:.5em 1.4em;background:#2a6;border:0;border-radius:
 
 String htmlEscape(const String& in);
 
+// Cables are numbered 0-15 on the wire but every host UI labels the same
+// things "port 1..16", so the page shows both and never just one.
+String portLabel(uint8_t cable) {
+    return "port " + String(cable + 1) + " (cable " + String(cable) + ")";
+}
+
+String bridgedPortText() {
+    uint8_t c = MidiBridge::bridgedCable();
+    return c == Config::CABLE_ALL ? String("all ports merged") : portLabel(c) + " only";
+}
+
 String statusSection() {
     String s = F("<h2>Status</h2><table>");
     s += "<tr><td>Firmware</td><td>v" FW_VERSION "</td></tr>";
@@ -61,9 +72,10 @@ String statusSection() {
     }
     s += "<tr><td>RTP-MIDI peers</td><td>" + peers + "</td></tr>";
     s += "<tr><td>USB MIDI</td><td>" + htmlEscape(UsbMidi::statusText()) + "</td></tr>";
+    s += "<tr><td>Bridged port</td><td>" + bridgedPortText() + "</td></tr>";
     s += "<tr><td>USB events</td><td>" + String(UsbMidi::eventCount()) + "</td></tr>";
     s += "<tr><td>USB &rarr; RTP</td><td>" + String(MidiBridge::forwardedCount()) +
-         " events (cable 1 only)</td></tr>";
+         " events</td></tr>";
     s += "<tr><td>RTP &rarr; USB</td><td>" + String(MidiBridge::returnedCount()) + " events, " +
          String(UsbMidi::txPacketCount()) + " packets delivered, " +
          String(UsbMidi::txDropCount()) + " dropped</td></tr>";
@@ -73,7 +85,15 @@ String statusSection() {
     if (UsbMidi::eventCount() > 0) {
         String ev;
         UsbMidi::appendRecentEvents(ev, "\n");
-        s += F("<p><small>Recent MIDI events (reload to refresh):</small></p><pre>");
+        s += F("<p><small>Recent MIDI from the device, cN = virtual cable "
+               "(reload to refresh):</small></p><pre>");
+        s += htmlEscape(ev);
+        s += F("</pre>");
+    }
+    if (UsbMidi::txFormattedCount() > 0) {
+        String ev;
+        UsbMidi::appendRecentTxEvents(ev, "\n");
+        s += F("<p><small>Recent MIDI to the device:</small></p><pre>");
         s += htmlEscape(ev);
         s += F("</pre>");
     }
@@ -156,6 +176,64 @@ String ssidChips() {
     return out;
 }
 
+// One <option> per MIDIStreaming interface the attached device presents, plus
+// "auto". Alternate settings of the same interface collapse into one row --
+// the firmware picks whichever alt actually carries endpoints.
+String usbIfaceOptions(uint8_t sel) {
+    String o = F("<option value='255'");
+    if (sel == Config::IFACE_AUTO) o += F(" selected");
+    o += F(">Auto &mdash; first MIDI interface the device offers</option>");
+    uint32_t listed = 0;  // interface numbers already emitted
+    UsbMidi::IfaceInfo f;
+    for (uint8_t i = 0; i < UsbMidi::ifaceCount(); i++) {
+        if (!UsbMidi::ifaceAt(i, f)) continue;
+        if (!f.epIn && !f.epOut) continue;  // alt setting with no endpoints
+        if (f.num < 32) {
+            if (listed & (1UL << f.num)) continue;
+            listed |= 1UL << f.num;
+        }
+        o += "<option value='" + String(f.num) + "'";
+        if (sel == f.num) o += F(" selected");
+        o += ">Interface " + String(f.num) + F(" &mdash; ");
+        // A device that omits the class-specific descriptor still has cable 0.
+        o += f.epIn ? String(f.inCables ? f.inCables : 1) + " in" : String("no input");
+        o += ", ";
+        o += f.epOut ? String(f.outCables ? f.outCables : 1) + " out" : String("no output");
+        o += F("</option>");
+    }
+    if (sel != Config::IFACE_AUTO && !(sel < 32 && (listed & (1UL << sel)))) {
+        // A stored selection stays visible even with its device unplugged --
+        // otherwise re-saving the form would silently discard it.
+        o += "<option value='" + String(sel) + "' selected>Interface " + String(sel) +
+             F(" &mdash; not present on the attached device</option>");
+    }
+    return o;
+}
+
+// All 16 cables are always offered: descriptors are not always honest about
+// how many a device has, so observed traffic is annotated alongside the
+// declared count and the user can pick any of them.
+String usbCableOptions(uint8_t sel) {
+    UsbMidi::IfaceInfo f;
+    uint8_t declared = 0;
+    if (UsbMidi::claimedInterfaceInfo(f)) {
+        declared = f.inCables > f.outCables ? f.inCables : f.outCables;
+    }
+    String o = F("<option value='255'");
+    if (sel == Config::CABLE_ALL) o += F(" selected");
+    o += F(">All ports, merged into one stream</option>");
+    for (uint8_t c = 0; c < 16; c++) {
+        o += "<option value='" + String(c) + "'";
+        if (sel == c) o += F(" selected");
+        o += ">Port " + String(c + 1) + " (cable " + String(c) + ")";
+        if (declared && c < declared) o += F(" &mdash; on the device");
+        uint32_t seen = UsbMidi::cableRxCount(c);
+        if (seen) o += " &mdash; " + String(seen) + " events seen";
+        o += F("</option>");
+    }
+    return o;
+}
+
 void handleRoot() {
     if (!authOk()) return server.requestAuthentication();
     const Config::Values& c = Config::get();
@@ -176,7 +254,21 @@ void handleRoot() {
     page += c.targetIp;
     page += F("'><label>Peer port</label><input type='number' name='tport' min='1' max='65535' value='");
     page += String(c.targetPort);
-    page += F("'><label>Static IP <small>(blank = DHCP)</small></label>"
+    page += F("'>"
+              "<label>USB MIDI interface <small>(which MIDI function of the device to "
+              "claim)</small></label><select name='uif'>");
+    page += usbIfaceOptions(c.usbIface);
+    page += F("</select>"
+              "<label>USB MIDI port to bridge <small>(a device's virtual cables are the "
+              "ports a DAW would list)</small></label><select name='ucab'>");
+    page += usbCableOptions(c.usbCable);
+    page += F("</select><p><small>Currently bridging ");
+    page += bridgedPortText();
+    page += F(". RTP-MIDI carries no port number, so one port is bridged in both "
+              "directions; \"all ports\" merges everything device&rarr;network and sends "
+              "network&rarr;device on port 1. Plug the device in and reload to see which "
+              "ports it presents and which are carrying traffic.</small></p>"
+              "<label>Static IP <small>(blank = DHCP)</small></label>"
               "<input type='text' name='sip' value='");
     page += htmlEscape(c.staticIp);
     page += F("'><label>Subnet mask</label><input type='text' name='smask' value='");
@@ -231,6 +323,14 @@ bool validIpv4(const String& s) {
     return dots == 3 && digits > 0;
 }
 
+bool allDigits(const String& s) {
+    if (!s.length()) return false;
+    for (size_t i = 0; i < s.length(); i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+    }
+    return true;
+}
+
 void handleConfigPost() {
     if (!authOk()) return server.requestAuthentication();
     Config::Values v = Config::get();
@@ -241,6 +341,26 @@ void handleConfigPost() {
     if (server.hasArg("tport")) {
         long p = server.arg("tport").toInt();
         if (p >= 1 && p <= 65535) v.targetPort = (uint16_t)p;
+    }
+    // USB MIDI selection. Both come from <select>s, so anything out of range
+    // is a crafted POST -- reject rather than store a value the bridge would
+    // then have to second-guess at every attach.
+    if (server.hasArg("uif")) {
+        const String& a = server.arg("uif");
+        if (!allDigits(a) || a.toInt() > 255) {
+            server.send(400, "text/html", "Not saved: invalid USB MIDI interface.");
+            return;
+        }
+        v.usbIface = (uint8_t)a.toInt();
+    }
+    if (server.hasArg("ucab")) {
+        const String& a = server.arg("ucab");
+        long n = a.toInt();
+        if (!allDigits(a) || !(n <= 15 || n == Config::CABLE_ALL)) {
+            server.send(400, "text/html", "Not saved: invalid USB MIDI port.");
+            return;
+        }
+        v.usbCable = (uint8_t)n;
     }
     // Static IP block: validate before saving anything -- a bad value that
     // slipped into NVS would only surface as an unreachable device.

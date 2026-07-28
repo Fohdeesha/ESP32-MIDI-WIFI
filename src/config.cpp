@@ -23,6 +23,11 @@ void Config::load() {
     values.staticMask = prefs.getString("smask", "255.255.255.0");
     values.staticGw = prefs.getString("sgw", "");
     values.staticDns = prefs.getString("sdns", "");
+    // Defaults reproduce the pre-1.3.0 hard-coded behavior: first MIDI
+    // interface the device offers, virtual cable 0 only.
+    values.usbIface = prefs.getUChar("uif", IFACE_AUTO);
+    values.usbCable = prefs.getUChar("ucab", 0);
+    if (values.usbCable > 15 && values.usbCable != CABLE_ALL) values.usbCable = 0;
     prefs.end();
 }
 
@@ -38,6 +43,8 @@ bool Config::save(const Values& v) {
     prefs.putString("smask", v.staticMask);
     prefs.putString("sgw", v.staticGw);
     prefs.putString("sdns", v.staticDns);
+    prefs.putUChar("uif", v.usbIface);
+    prefs.putUChar("ucab", v.usbCable);
     prefs.end();
     values = v;
     return true;

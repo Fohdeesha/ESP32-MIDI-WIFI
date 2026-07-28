@@ -4,15 +4,22 @@
 
 #include <cstring>
 
+#include "config.h"
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
 
 // USB -> network direction first, RTP -> USB below.
 namespace {
 
-// Only the P1-M's first virtual MIDI cable carries the control surface;
-// the other three are unused ports we deliberately don't bridge.
-constexpr uint8_t BRIDGED_CABLE = 0;
+// Which virtual cable of the claimed USB MIDI function is bridged. A device
+// can present up to 16 cables (the "ports" a DAW lists) on one interface;
+// RTP-MIDI has no cable concept, so exactly one is bridged unless the user
+// asks for CABLE_ALL and accepts that they arrive merged.
+uint8_t s_cable = 0;
+// High nibble stamped on device-bound packets. With CABLE_ALL there is no one
+// right answer for the reverse direction, so it goes to cable 0 -- the cable
+// every compliant device implements.
+uint8_t s_outNibble = 0;
 
 uint32_t s_forwarded = 0;
 
@@ -44,10 +51,24 @@ void sysexEnd(const uint8_t* bytes, uint8_t n) {
 
 }  // namespace
 
+void MidiBridge::begin(uint8_t cable) {
+    s_cable = (cable == Config::CABLE_ALL || cable <= 15) ? cable : 0;
+    s_outNibble = s_cable == Config::CABLE_ALL ? 0 : (uint8_t)(s_cable << 4);
+    if (s_cable == Config::CABLE_ALL) {
+        Serial.println("[bridge] bridging all virtual cables (merged); output on cable 0");
+    } else {
+        Serial.printf("[bridge] bridging virtual cable %u only\n", s_cable);
+    }
+}
+
+uint8_t MidiBridge::bridgedCable() {
+    return s_cable;
+}
+
 void MidiBridge::tick() {
     uint8_t p[4];
     while (UsbMidi::readPacket(p)) {
-        if ((p[0] >> 4) != BRIDGED_CABLE) continue;
+        if (s_cable != Config::CABLE_ALL && (p[0] >> 4) != s_cable) continue;
         if (!RtpMidi::hasPeer()) continue;
         uint8_t ch = (p[1] & 0x0F) + 1;
         switch (p[0] & 0x0F) {
@@ -102,13 +123,13 @@ uint32_t MidiBridge::forwardedCount() {
 }
 
 // ---- RTP -> USB (0.7.0) ----------------------------------------------------
-// Everything goes out on virtual cable 0, mirroring the inbound filter.
+// Everything goes out on the configured cable, mirroring the inbound filter.
 
 namespace {
 uint32_t s_returned = 0;
 
 void usbSend(uint8_t cin, uint8_t status, uint8_t d1, uint8_t d2) {
-    uint8_t pkt[4] = {cin, status, d1, d2};  // cable 0: high nibble stays 0
+    uint8_t pkt[4] = {(uint8_t)(s_outNibble | cin), status, d1, d2};
     if (UsbMidi::writePacket(pkt)) s_returned++;
 }
 }  // namespace
@@ -149,12 +170,12 @@ void MidiBridge::rtpSysEx(const uint8_t* data, uint16_t length) {
     bool ok = true;
     uint16_t i = 0;
     while (length - i > 3) {
-        uint8_t pkt[4] = {0x4, data[i], data[i + 1], data[i + 2]};
+        uint8_t pkt[4] = {(uint8_t)(s_outNibble | 0x4), data[i], data[i + 1], data[i + 2]};
         ok &= UsbMidi::writePacket(pkt);
         i += 3;
     }
     uint8_t rem = length - i;
-    uint8_t pkt[4] = {(uint8_t)(0x4 + rem), 0, 0, 0};
+    uint8_t pkt[4] = {(uint8_t)(s_outNibble | (0x4 + rem)), 0, 0, 0};
     memcpy(&pkt[1], &data[i], rem);
     ok &= UsbMidi::writePacket(pkt);
     if (ok) s_returned++;
@@ -208,22 +229,23 @@ void MidiBridge::healthTick() {
 // ---- Surface blanking on session loss (1.2.0) ------------------------------
 
 namespace {
-// Chunk one complete sysex (F0..F7) into USB-MIDI event packets on cable 0.
+// Chunk one complete sysex (F0..F7) into USB-MIDI event packets on the
+// configured cable.
 void usbSysEx(const uint8_t* data, uint16_t length) {
     uint16_t i = 0;
     while (length - i > 3) {
-        uint8_t pkt[4] = {0x4, data[i], data[i + 1], data[i + 2]};
+        uint8_t pkt[4] = {(uint8_t)(s_outNibble | 0x4), data[i], data[i + 1], data[i + 2]};
         UsbMidi::writePacket(pkt);
         i += 3;
     }
     uint8_t rem = length - i;
-    uint8_t pkt[4] = {(uint8_t)(0x4 + rem), 0, 0, 0};
+    uint8_t pkt[4] = {(uint8_t)(s_outNibble | (0x4 + rem)), 0, 0, 0};
     memcpy(&pkt[1], &data[i], rem);
     UsbMidi::writePacket(pkt);
 }
 
 void usbShort(uint8_t cin, uint8_t status, uint8_t d1, uint8_t d2) {
-    uint8_t pkt[4] = {cin, status, d1, d2};
+    uint8_t pkt[4] = {(uint8_t)(s_outNibble | cin), status, d1, d2};
     UsbMidi::writePacket(pkt);
 }
 

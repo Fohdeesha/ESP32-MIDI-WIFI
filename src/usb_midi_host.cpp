@@ -15,8 +15,15 @@ namespace {
 
 constexpr uint8_t USB_CLASS_AUDIO_ = 0x01;
 constexpr uint8_t USB_SUBCLASS_MIDI_STREAMING = 0x03;
+// Class-specific endpoint descriptor, MS_GENERAL subtype: carries
+// bNumEmbMIDIJack, the number of virtual cables on the endpoint it follows.
+constexpr uint8_t USB_DESC_CS_ENDPOINT = 0x25;
+constexpr uint8_t MS_GENERAL = 0x01;
 
 constexpr int NUM_RX_TRANSFERS = 2;  // keep one IN transfer always pending
+// More MIDIStreaming interfaces than any real device presents (a multi-port
+// interface uses cables, not extra interfaces); alt settings count separately.
+constexpr int MAX_MIDI_IFACES = 8;
 
 struct MidiPacket {
     uint8_t b[4];
@@ -28,9 +35,18 @@ QueueHandle_t s_queue = nullptr;
 
 uint8_t s_ifaceNum = 0;
 uint8_t s_ifaceAlt = 0;
-uint8_t s_epIn = 0;   // IN endpoint address; 0 = no MIDI interface found
+uint8_t s_epIn = 0;   // IN endpoint address; 0 = claimed function is send-only
 uint8_t s_epOut = 0;  // OUT endpoint address; 0 = device has no MIDI input
 uint16_t s_epOutMps = 64;
+
+// Every MIDIStreaming interface of the attached device, for the web UI picker,
+// plus which one the user asked for and which one we ended up claiming.
+UsbMidi::IfaceInfo s_ifaceList[MAX_MIDI_IFACES];
+uint8_t s_ifaceListCount = 0;
+uint8_t s_prefIface = 0xFF;     // configured bInterfaceNumber, 0xFF = auto
+uint8_t s_claimedIface = 0xFF;  // 0xFF = nothing claimed
+bool s_ifaceFallback = false;   // configured interface absent on this device
+uint32_t s_cableRx[16] = {};    // packets per virtual cable, since attach
 usb_transfer_t* s_xfers[NUM_RX_TRANSFERS] = {};
 usb_transfer_t* s_txXfer = nullptr;
 QueueHandle_t s_txQueue = nullptr;
@@ -54,7 +70,7 @@ volatile uint8_t s_pendingAddr = 0;
 volatile bool s_pendingGone = false;
 volatile bool s_connected = false;
 char s_productName[64] = "";
-char s_statusText[96] = "not started";
+char s_statusText[192] = "not started";
 
 // Raw + parsed config descriptor of the last attached device, for the web
 // UI's debug view. Filled once per attach, before s_connected flips.
@@ -153,53 +169,128 @@ void onTxDone(usb_transfer_t* xfer) {
     }
 }
 
-// Walks the active config descriptor for the first MIDIStreaming interface
-// and its endpoints. Returns false if the device has no MIDI IN function.
-bool findMidiInterface() {
-    const usb_config_desc_t* cfg = nullptr;
-    if (usb_host_get_active_config_descriptor(s_device, &cfg) != ESP_OK) return false;
-
-    const uint8_t* p = (const uint8_t*)cfg;
-    const uint8_t* end = p + cfg->wTotalLength;
-    bool inMidiIface = false;
-    s_epIn = 0;
-    while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
-        if (p[1] == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
-            const usb_intf_desc_t* id = (const usb_intf_desc_t*)p;
-            inMidiIface = (id->bInterfaceClass == USB_CLASS_AUDIO_ &&
-                           id->bInterfaceSubClass == USB_SUBCLASS_MIDI_STREAMING);
-            if (inMidiIface && s_epIn == 0) {
-                s_ifaceNum = id->bInterfaceNumber;
-                s_ifaceAlt = id->bAlternateSetting;
-            }
-        } else if (p[1] == USB_B_DESCRIPTOR_TYPE_ENDPOINT && inMidiIface) {
-            const usb_ep_desc_t* ed = (const usb_ep_desc_t*)p;
-            uint8_t type = ed->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK;
-            bool usable =
-                (type == USB_BM_ATTRIBUTES_XFER_BULK || type == USB_BM_ATTRIBUTES_XFER_INT);
-            if (usable && (ed->bEndpointAddress & 0x80) && s_epIn == 0) {
-                s_epIn = ed->bEndpointAddress;
-                for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
-                    if (!s_xfers[i]) usb_host_transfer_alloc(ed->wMaxPacketSize, 0, &s_xfers[i]);
-                    s_xfers[i]->device_handle = s_device;
-                    s_xfers[i]->bEndpointAddress = s_epIn;
-                    s_xfers[i]->num_bytes = ed->wMaxPacketSize;
-                    s_xfers[i]->callback = onTransferDone;
-                    s_xfers[i]->context = nullptr;
+// Walks the active config descriptor and records EVERY MIDIStreaming
+// interface (each alternate setting separately) with its bulk/interrupt
+// endpoints and declared cable counts. Selection happens afterwards, so the
+// web UI can offer whatever the device actually presents rather than the
+// firmware silently taking the first thing it sees.
+void enumerateMidiIfaces(const usb_config_desc_t* cfg) {
+    uint8_t count = 0;
+    if (cfg) {
+        const uint8_t* p = (const uint8_t*)cfg;
+        const uint8_t* end = p + cfg->wTotalLength;
+        UsbMidi::IfaceInfo* cur = nullptr;
+        bool lastEpWasIn = false;
+        while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
+            uint8_t type = p[1];
+            if (type == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+                const usb_intf_desc_t* id = (const usb_intf_desc_t*)p;
+                cur = nullptr;
+                if (id->bInterfaceClass == USB_CLASS_AUDIO_ &&
+                    id->bInterfaceSubClass == USB_SUBCLASS_MIDI_STREAMING &&
+                    count < MAX_MIDI_IFACES) {
+                    cur = &s_ifaceList[count++];
+                    *cur = UsbMidi::IfaceInfo{};
+                    cur->num = id->bInterfaceNumber;
+                    cur->alt = id->bAlternateSetting;
                 }
-            } else if (usable && !(ed->bEndpointAddress & 0x80) && s_epOut == 0) {
-                s_epOut = ed->bEndpointAddress;
-                s_epOutMps = ed->wMaxPacketSize;
-                if (!s_txXfer) usb_host_transfer_alloc(s_epOutMps, 0, &s_txXfer);
-                s_txXfer->device_handle = s_device;
-                s_txXfer->bEndpointAddress = s_epOut;
-                s_txXfer->callback = onTxDone;
-                s_txXfer->context = nullptr;
+            } else if (type == USB_B_DESCRIPTOR_TYPE_ENDPOINT && cur) {
+                const usb_ep_desc_t* ed = (const usb_ep_desc_t*)p;
+                uint8_t xt = ed->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK;
+                if (xt == USB_BM_ATTRIBUTES_XFER_BULK || xt == USB_BM_ATTRIBUTES_XFER_INT) {
+                    lastEpWasIn = (ed->bEndpointAddress & 0x80) != 0;
+                    if (lastEpWasIn && cur->epIn == 0) {
+                        cur->epIn = ed->bEndpointAddress;
+                        cur->epInMps = ed->wMaxPacketSize;
+                    } else if (!lastEpWasIn && cur->epOut == 0) {
+                        cur->epOut = ed->bEndpointAddress;
+                        cur->epOutMps = ed->wMaxPacketSize;
+                    }
+                }
+            } else if (type == USB_DESC_CS_ENDPOINT && cur && p[0] >= 4 && p[2] == MS_GENERAL) {
+                // Applies to the endpoint descriptor immediately above it.
+                if (lastEpWasIn) {
+                    cur->inCables = p[3];
+                } else {
+                    cur->outCables = p[3];
+                }
             }
+            p += p[0];
         }
-        p += p[0];
     }
-    return s_epIn != 0;
+    s_ifaceListCount = count;  // publish only once the entries are filled
+}
+
+// Index of the first usable interface, optionally restricted to one
+// bInterfaceNumber (wantedNum < 0 = any). Pass 1 prefers a setting that can
+// receive from the device; pass 2 accepts a send-only (OUT-only) function,
+// which is all some devices -- a synth or a display -- ever offer.
+int firstUsableIface(int wantedNum) {
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint8_t i = 0; i < s_ifaceListCount; i++) {
+            const UsbMidi::IfaceInfo& f = s_ifaceList[i];
+            bool usable = pass == 0 ? f.epIn != 0 : (f.epIn != 0 || f.epOut != 0);
+            if (!usable) continue;
+            if (wantedNum >= 0 && f.num != (uint8_t)wantedNum) continue;
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Applies the configured selection, falling back to auto (and saying so) when
+// the configured interface isn't on this device -- a stale selection from a
+// different device must not leave the bridge silently dead.
+int chooseIface() {
+    s_ifaceFallback = false;
+    int pick = firstUsableIface(s_prefIface == 0xFF ? -1 : s_prefIface);
+    if (pick < 0 && s_prefIface != 0xFF) {
+        pick = firstUsableIface(-1);
+        s_ifaceFallback = pick >= 0;
+        if (s_ifaceFallback) {
+            Serial.printf("[usb] configured interface %u absent -- using %u instead\n",
+                          s_prefIface, s_ifaceList[pick].num);
+        }
+    }
+    return pick;
+}
+
+// Points the module's endpoint state at one enumerated interface and allocates
+// its transfers. Returns false if neither direction could be prepared.
+bool prepareIface(int idx) {
+    const UsbMidi::IfaceInfo& f = s_ifaceList[idx];
+    s_ifaceNum = f.num;
+    s_ifaceAlt = f.alt;
+    s_epIn = f.epIn;
+    s_epOut = f.epOut;
+    s_epOutMps = f.epOutMps ? f.epOutMps : 64;
+    if (s_epIn) {
+        uint16_t mps = f.epInMps ? f.epInMps : 64;
+        for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
+            if (!s_xfers[i] && usb_host_transfer_alloc(mps, 0, &s_xfers[i]) != ESP_OK) {
+                s_xfers[i] = nullptr;
+                continue;
+            }
+            s_xfers[i]->device_handle = s_device;
+            s_xfers[i]->bEndpointAddress = s_epIn;
+            s_xfers[i]->num_bytes = mps;
+            s_xfers[i]->callback = onTransferDone;
+            s_xfers[i]->context = nullptr;
+        }
+        if (!s_xfers[0]) s_epIn = 0;  // out of memory: treat as send-only
+    }
+    if (s_epOut) {
+        if (!s_txXfer && usb_host_transfer_alloc(s_epOutMps, 0, &s_txXfer) != ESP_OK) {
+            s_txXfer = nullptr;
+            s_epOut = 0;
+        } else {
+            s_txXfer->device_handle = s_device;
+            s_txXfer->bEndpointAddress = s_epOut;
+            s_txXfer->callback = onTxDone;
+            s_txXfer->context = nullptr;
+        }
+    }
+    return s_epIn != 0 || s_epOut != 0;
 }
 
 // The P1-M reports its high-speed bulk MPS (512) even when enumerated at
@@ -243,9 +334,12 @@ void attachDevice(uint8_t addr) {
     usb_host_get_active_config_descriptor(s_device, &cfg);
     dumpDescriptors(cfg);       // dump shows the device's original values
     clampFullSpeedMps(cfg);     // ...then sanitize before claiming
+    enumerateMidiIfaces(cfg);
+    memset(s_cableRx, 0, sizeof(s_cableRx));  // counts are per-attach
 
-    if (!findMidiInterface()) {
-        Serial.println("[usb] no MIDIStreaming interface -- not a USB MIDI device?");
+    int pick = chooseIface();
+    if (pick < 0 || !prepareIface(pick)) {
+        Serial.println("[usb] no usable MIDIStreaming interface -- not a USB MIDI device?");
         snprintf(s_statusText, sizeof(s_statusText), "\"%s\" (%04x:%04x): no MIDI interface",
                  s_productName, dd ? dd->idVendor : 0, dd ? dd->idProduct : 0);
         usb_host_device_close(s_client, s_device);
@@ -267,16 +361,21 @@ void attachDevice(uint8_t addr) {
         return;
     }
     s_connected = true;
-    snprintf(s_statusText, sizeof(s_statusText), "connected: \"%s\"", s_productName);
+    s_claimedIface = s_ifaceNum;
+    snprintf(s_statusText, sizeof(s_statusText), "connected: \"%s\" on interface %u%s%s",
+             s_productName, s_ifaceNum, s_epIn ? "" : " (device-bound only)",
+             s_ifaceFallback ? " -- configured interface absent" : "");
     s_rxActive = 0;
     for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
-        if (usb_host_transfer_submit(s_xfers[i]) == ESP_OK) {
+        if (s_xfers[i] && usb_host_transfer_submit(s_xfers[i]) == ESP_OK) {
             s_inFlight++;
             s_rxActive++;
         }
     }
-    Serial.printf("[usb] MIDI interface %u claimed, IN ep 0x%02x -- listening\n", s_ifaceNum,
-                  s_epIn);
+    Serial.printf("[usb] MIDI interface %u alt %u claimed, IN ep 0x%02x OUT ep 0x%02x "
+                  "(%u/%u cables declared) -- listening\n",
+                  s_ifaceNum, s_ifaceAlt, s_epIn, s_epOut, s_ifaceList[pick].inCables,
+                  s_ifaceList[pick].outCables);
 }
 
 void detachDevice() {
@@ -308,6 +407,8 @@ void detachDevice() {
     s_rxActive = 0;
     s_epIn = 0;
     s_epOut = 0;
+    s_claimedIface = 0xFF;
+    s_ifaceFallback = false;
     s_productName[0] = '\0';
     snprintf(s_statusText, sizeof(s_statusText), "host active, no device");
     Serial.println("[usb] device disconnected");
@@ -353,15 +454,22 @@ void daemonTask(void*) {
 constexpr int LOG_RING = 12;
 char s_ring[LOG_RING][48];
 uint32_t s_eventCount = 0;
+// Same ring for the device-bound direction: with a configurable cable the
+// nibble actually stamped on outgoing packets has to be observable, not just
+// assumed. Written from the loop task only (writePacket), like the RX ring.
+char s_txRing[LOG_RING][48];
+uint32_t s_txFormatted = 0;
 
 // Formats one decoded event into buf; returns false for events not worth
-// showing (realtime clock/active-sense spam, reserved CINs).
+// showing (realtime clock/active-sense spam, reserved CINs). The cable number
+// is always shown -- which cable a packet is on is the point of the port
+// setting, so it must never be implicit.
 bool formatPacket(const MidiPacket& p, char* buf, size_t len) {
     uint8_t cable = p.b[0] >> 4;
     uint8_t cin = p.b[0] & 0x0F;
     uint8_t ch = (p.b[1] & 0x0F) + 1;
-    char pre[8] = "";
-    if (cable) snprintf(pre, sizeof(pre), "c%u ", cable);
+    char pre[8];
+    snprintf(pre, sizeof(pre), "c%u ", cable);
     switch (cin) {
         case 0x8:
             snprintf(buf, len, "%sch%u note off %u vel %u", pre, ch, p.b[2], p.b[3]);
@@ -403,7 +511,8 @@ bool formatPacket(const MidiPacket& p, char* buf, size_t len) {
 
 }  // namespace
 
-void UsbMidi::begin() {
+void UsbMidi::begin(uint8_t preferredInterface) {
+    s_prefIface = preferredInterface;
     s_queue = xQueueCreate(128, sizeof(MidiPacket));
     // Sized for a busy host's ~10 s full surface re-assert: one burst is
     // 300+ event packets (32 display cells as chunked sysex + every LED,
@@ -446,6 +555,7 @@ bool UsbMidi::readPacket(uint8_t out[4]) {
     if (!s_queue) return false;
     MidiPacket pkt;
     if (xQueueReceive(s_queue, &pkt, 0) != pdTRUE) return false;
+    s_cableRx[pkt.b[0] >> 4]++;
     char* slot = s_ring[s_eventCount % LOG_RING];
     if (formatPacket(pkt, slot, sizeof(s_ring[0]))) {
         Serial.printf("[usb] %s\n", slot);
@@ -465,6 +575,11 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
         s_txDropped++;
         return false;
     }
+    MidiPacket rec;
+    memcpy(rec.b, pkt, 4);
+    if (formatPacket(rec, s_txRing[s_txFormatted % LOG_RING], sizeof(s_txRing[0]))) {
+        s_txFormatted++;
+    }
     usb_host_client_unblock(s_client);  // wake the client task to send now
     return true;
 }
@@ -483,10 +598,46 @@ bool UsbMidi::deviceConnected() {
 
 bool UsbMidi::healthy() {
     if (!s_connected) return false;
-    if (s_rxActive <= 0) return false;  // IN pipeline errored idle: deaf device
+    // Only meaningful when the claimed function can receive at all: an
+    // OUT-only device has no IN pipeline to judge, and demanding one would
+    // permanently suppress the heartbeat for it.
+    if (s_epIn && s_rxActive <= 0) return false;  // IN pipeline errored idle: deaf device
     const uint32_t sub = s_txSubmitMs;
     if (sub != 0 && millis() - sub > 2000) return false;  // OUT unACKed: wedged
     return true;
+}
+
+uint8_t UsbMidi::ifaceCount() {
+    return s_ifaceListCount;
+}
+
+bool UsbMidi::ifaceAt(uint8_t i, IfaceInfo& out) {
+    if (i >= s_ifaceListCount) return false;
+    out = s_ifaceList[i];
+    return true;
+}
+
+uint8_t UsbMidi::claimedInterface() {
+    return s_claimedIface;
+}
+
+bool UsbMidi::claimedInterfaceInfo(IfaceInfo& out) {
+    if (s_claimedIface == 0xFF) return false;
+    for (uint8_t i = 0; i < s_ifaceListCount; i++) {
+        if (s_ifaceList[i].num == s_ifaceNum && s_ifaceList[i].alt == s_ifaceAlt) {
+            out = s_ifaceList[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+bool UsbMidi::interfaceFellBack() {
+    return s_ifaceFallback;
+}
+
+uint32_t UsbMidi::cableRxCount(uint8_t cable) {
+    return cable < 16 ? s_cableRx[cable] : 0;
 }
 
 const char* UsbMidi::deviceName() {
@@ -511,4 +662,16 @@ void UsbMidi::appendRecentEvents(String& out, const char* sep) {
         if (i) out += sep;
         out += s_ring[(s_eventCount - n + i) % LOG_RING];
     }
+}
+
+void UsbMidi::appendRecentTxEvents(String& out, const char* sep) {
+    uint32_t n = s_txFormatted < LOG_RING ? s_txFormatted : LOG_RING;
+    for (uint32_t i = 0; i < n; i++) {  // oldest first
+        if (i) out += sep;
+        out += s_txRing[(s_txFormatted - n + i) % LOG_RING];
+    }
+}
+
+uint32_t UsbMidi::txFormattedCount() {
+    return s_txFormatted;
 }

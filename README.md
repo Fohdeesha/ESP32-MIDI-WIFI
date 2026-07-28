@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.2.0**
+**Current version: 1.3.0**
 
 ## How it works
 
@@ -29,13 +29,19 @@ USB MIDI class driver ◄──► MIDI event queues (FreeRTOS)
 The bridge is fully bidirectional: notes and controls flow from the USB device
 to the network, and network MIDI flows back to the device (LEDs, motorized
 faders, displays on control surfaces). SysEx is chunked and reassembled
-correctly in both directions. Virtual cable 0 is bridged.
+correctly in both directions. Which of the device's MIDI ports is bridged is
+configurable (default: the first one).
 
 ## Features
 
 - **USB host** for class-compliant USB MIDI devices, including workarounds for
   common descriptor quirks (e.g. devices that report a high-speed bulk packet
   size on a full-speed link).
+- **Selectable MIDI port**: multi-port devices present several virtual cables
+  (and occasionally several MIDI interfaces) — pick which one to bridge from
+  the web UI, or merge them all. The picker lists what the attached device
+  actually presents, with live per-port event counters so you can tell which
+  port your controller is really using.
 - **Bidirectional RTP-MIDI bridge** hardened for sustained high-rate traffic
   (large parse buffer so no datagram straddles reads, deep TX queue with
   backpressure so device-bound SysEx bursts don't tear).
@@ -43,8 +49,9 @@ correctly in both directions. Virtual cable 0 is bridged.
   AppleMIDI invitations; optionally configure a peer IP:port and it will
   initiate (and re-invite every 30 s until connected).
 - **Web config UI** (`http://esp32-midi.local/`): status, WiFi and network
-  settings, RTP-MIDI session settings, password management, factory reset, and
-  a live diagnostics view (USB state, decoded recent MIDI events, RTP-MIDI
+  settings, RTP-MIDI session settings, MIDI port selection, password
+  management, factory reset, and a live diagnostics view (USB state, decoded
+  recent MIDI events in both directions with their port numbers, RTP-MIDI
   session event log, USB descriptor dump).
 - **Static IP or DHCP** (DHCP by default), configurable from the web UI with
   validation.
@@ -127,6 +134,21 @@ Everything is set from the web UI:
 - **Connect to peer**: leave blank to accept incoming session invitations, or
   enter an IP (and port) to have the device initiate the session — useful when
   the other end is also a listener.
+- **USB MIDI interface**: which MIDI function of the attached device to claim.
+  Almost every device has exactly one, so leave this on *Auto*; the list shows
+  each MIDIStreaming interface the device presents and how many virtual cables
+  it declares in each direction. A saved selection that isn't on the currently
+  attached device falls back to the first usable one, and the status line says
+  so rather than silently going quiet.
+- **USB MIDI port to bridge**: which of the device's virtual cables (the
+  "ports" a DAW would list — MIDI 1, MIDI 2, …) to bridge. Defaults to port 1.
+  Ports the device declares are marked, and any port that has carried traffic
+  shows its event count, so you can identify the right one even for devices
+  whose descriptors understate what they have. RTP-MIDI carries no port
+  number, so one port is bridged in both directions; *All ports* merges every
+  incoming port into the single network stream and sends network → device
+  traffic on port 1. Changes take effect after the reboot that saving
+  triggers.
 - **Static IP**: leave blank for DHCP, or set address, subnet mask, gateway
   (optional), and DNS (optional, defaults to the gateway). Inputs are
   validated before saving. Note that a wrong-but-valid static address can make
@@ -141,6 +163,18 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.3.0 — selectable MIDI port: which MIDI function of the attached device
+  (MIDIStreaming interface) and which of its up to 16 virtual cables get
+  bridged are now set from the web UI, instead of being fixed at the first
+  interface and cable 0. The picker lists what the device actually presents —
+  every MIDIStreaming interface with its declared cable counts, plus live
+  per-port event counters so a device whose descriptors understate its ports
+  can still be configured from observed traffic — and "All ports" merges every
+  port device → network. A saved selection that is absent on the attached
+  device falls back to the first usable interface rather than leaving the
+  bridge silently dead; send-only devices (no MIDI IN endpoint) are now
+  supported; and the status page gained a device-bound MIDI event log next to
+  the existing inbound one, both labelled with the port each message is on
 - 1.2.0 — session health: the bridge now sends MIDI Active Sensing (0xFE)
   every 250 ms while (and only while) its USB device is attached and
   demonstrably working — IN pipeline live, OUT transfers ACKing — so a host

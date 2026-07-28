@@ -3,7 +3,14 @@
 #include <cstdint>
 
 namespace MidiBridge {
-// Drains parsed USB MIDI packets and forwards virtual cable 0 into the
+// Selects which virtual cable of the claimed USB MIDI function is bridged
+// (Config::CABLE_ALL = every cable, merged, since RTP-MIDI carries no cable
+// number). Also the cable stamped on device-bound packets -- with CABLE_ALL
+// that is cable 0. Call once from setup() after Config::load(); the setting
+// only changes across a reboot, which is what saving config does.
+void begin(uint8_t cable);
+uint8_t bridgedCable();  // current selection, Config::CABLE_ALL when merged
+// Drains parsed USB MIDI packets and forwards the selected cable into the
 // RTP-MIDI session (other cables are logged but not bridged). Call from
 // loop after RtpMidi::tick().
 void tick();
