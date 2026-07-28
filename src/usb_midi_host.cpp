@@ -36,6 +36,7 @@ usb_transfer_t* s_txXfer = nullptr;
 QueueHandle_t s_txQueue = nullptr;
 bool s_txInFlight = false;  // touched only from the client task
 uint32_t s_txDone = 0;
+uint32_t s_txDropped = 0;  // packets lost to a full TX queue (post-backpressure)
 volatile int s_inFlight = 0;
 
 // Flags set in the client event callback, acted on in the client task loop
@@ -381,7 +382,10 @@ bool formatPacket(const MidiPacket& p, char* buf, size_t len) {
 
 void UsbMidi::begin() {
     s_queue = xQueueCreate(128, sizeof(MidiPacket));
-    s_txQueue = xQueueCreate(128, sizeof(MidiPacket));
+    // Sized for the EGM bridge's ~10 s full surface re-assert: one burst is
+    // 300+ event packets (32 display cells as chunked sysex + every LED,
+    // ring, meter and fader), and dropping mid-sysex tears the frame.
+    s_txQueue = xQueueCreate(1024, sizeof(MidiPacket));
 
     usb_host_config_t hostCfg = {};
     hostCfg.skip_phy_setup = false;
@@ -430,9 +434,20 @@ bool UsbMidi::readPacket(uint8_t out[4]) {
 
 bool UsbMidi::writePacket(const uint8_t pkt[4]) {
     if (!s_connected || !s_epOut || !s_txQueue) return false;
-    if (xQueueSend(s_txQueue, pkt, 0) != pdTRUE) return false;
+    // Brief backpressure instead of an instant drop: a packet lost mid-sysex
+    // desyncs the P1-M's display parser, and the client task drains the queue
+    // continuously (a full-speed bulk transfer carries 16 packets per ms), so
+    // 20 ms is enough to ride out any burst the RTP side can produce.
+    if (xQueueSend(s_txQueue, pkt, pdMS_TO_TICKS(20)) != pdTRUE) {
+        s_txDropped++;
+        return false;
+    }
     usb_host_client_unblock(s_client);  // wake the client task to send now
     return true;
+}
+
+uint32_t UsbMidi::txDropCount() {
+    return s_txDropped;
 }
 
 uint32_t UsbMidi::txPacketCount() {

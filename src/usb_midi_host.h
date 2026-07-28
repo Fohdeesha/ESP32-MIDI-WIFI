@@ -14,9 +14,11 @@ void begin();
 // empty. Call from loop context only.
 bool readPacket(uint8_t out[4]);
 // Queues one 4-byte USB-MIDI event packet for transmission to the device.
-// Returns false when no device is attached or the TX queue is full.
+// Waits up to 20 ms for queue space (burst backpressure); returns false when
+// no device is attached or the queue stayed full.
 bool writePacket(const uint8_t pkt[4]);
 uint32_t txPacketCount();  // packets confirmed delivered on the wire
+uint32_t txDropCount();    // packets lost to a full TX queue despite the wait
 bool deviceConnected();
 const char* deviceName();  // product string of the attached device, "" if none
 const char* statusText();  // human-readable host state for the web UI

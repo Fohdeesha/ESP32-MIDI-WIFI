@@ -63,7 +63,8 @@ String statusSection() {
     s += "<tr><td>USB &rarr; RTP</td><td>" + String(MidiBridge::forwardedCount()) +
          " events (cable 1 only)</td></tr>";
     s += "<tr><td>RTP &rarr; USB</td><td>" + String(MidiBridge::returnedCount()) + " events, " +
-         String(UsbMidi::txPacketCount()) + " packets delivered</td></tr>";
+         String(UsbMidi::txPacketCount()) + " packets delivered, " +
+         String(UsbMidi::txDropCount()) + " dropped</td></tr>";
     s += "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>";
     s += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " kB</td></tr>";
     s += F("</table>");
