@@ -21,6 +21,9 @@ void sendAfterTouchPoly(uint8_t channel, uint8_t note, uint8_t pressure);
 void sendPitchBend(uint8_t channel, int value);  // -8192..8191
 // data must include the F0/F7 framing bytes.
 void sendSysEx(const uint8_t* data, uint16_t length);
+// One MIDI Active Sensing (0xFE) byte -- the session-health heartbeat
+// (MidiBridge::healthTick owns the cadence and the device-health gating).
+void sendActiveSensing();
 // Appends the session-event ring (connects/disconnects/library exceptions,
 // oldest first) for the web status page.
 void appendEventLog(String& out, const char* sep);

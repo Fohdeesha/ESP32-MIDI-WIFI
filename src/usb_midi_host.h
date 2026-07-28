@@ -20,6 +20,14 @@ bool writePacket(const uint8_t pkt[4]);
 uint32_t txPacketCount();  // packets confirmed delivered on the wire
 uint32_t txDropCount();    // packets lost to a full TX queue despite the wait
 bool deviceConnected();
+// True while the attached device is demonstrably WORKING, not merely present:
+// connected AND the IN pipeline has live transfers (an errored-idle RX pipe is
+// a deaf device that still enumerates) AND no OUT transfer has sat unACKed for
+// >2 s (a healthy bulk OUT completes in under a millisecond; a wedged device
+// controller can NAK forever while still looking attached). This is what gates
+// the session health heartbeat -- the bridge must never claim a device it
+// cannot actually talk to is alive.
+bool healthy();
 const char* deviceName();  // product string of the attached device, "" if none
 const char* statusText();  // human-readable host state for the web UI
 uint32_t eventCount();     // MIDI events received since boot

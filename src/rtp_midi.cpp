@@ -104,7 +104,12 @@ void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/, const char* na
 void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/) {
     if (s_peerCount > 0) s_peerCount--;
     evlog("disconnected (peers %d)", s_peerCount);
-    if (s_peerCount == 0) StatusLed::set(LedStatus::WifiConnected);
+    if (s_peerCount == 0) {
+        StatusLed::set(LedStatus::WifiConnected);
+        // An orphaned surface must not keep showing the dead session's last
+        // frame as if it were live -- dark is honest (1.2.0).
+        MidiBridge::blankSurface();
+    }
 }
 
 // Incoming MIDI from the RTP peer, handed to the bridge (RTP -> USB).
@@ -197,6 +202,11 @@ void RtpMidi::sendPitchBend(uint8_t channel, int value) {
 
 void RtpMidi::sendSysEx(const uint8_t* data, uint16_t length) {
     if (started && s_peerCount > 0) MIDI.sendSysEx(length, data, true);
+}
+
+void RtpMidi::sendActiveSensing() {
+    if (started && s_peerCount > 0)
+        MIDI.sendRealTime(midi::ActiveSensing);
 }
 
 void RtpMidi::appendEventLog(String& out, const char* sep) {

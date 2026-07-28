@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.1.0**
+**Current version: 1.2.0**
 
 ## How it works
 
@@ -141,6 +141,15 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.2.0 — session health: the bridge now sends MIDI Active Sensing (0xFE)
+  every 250 ms while (and only while) its USB device is attached and
+  demonstrably working — IN pipeline live, OUT transfers ACKing — so a host
+  can treat its absence as "bridge or device gone" within a second instead
+  of waiting out a session timeout; explicit device attach/detach status
+  messages (sysex F0 7D 55 4D 42 <state> F7); a deaf-but-enumerated USB
+  pipeline now counts as unhealthy instead of silently looking fine; and on
+  session loss the bridge blanks a Mackie-Control-family surface (displays,
+  LEDs, meters) so a frozen display can't masquerade as a live one
 - 1.1.0 — static IP support (web-configurable, validated, DHCP remains the
   default)
 - 1.0.0 — load-hardening after sustained high-traffic soak testing: fixed

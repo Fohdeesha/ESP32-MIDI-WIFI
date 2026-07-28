@@ -38,6 +38,15 @@ bool s_txInFlight = false;  // touched only from the client task
 uint32_t s_txDone = 0;
 uint32_t s_txDropped = 0;  // packets lost to a full TX queue (post-backpressure)
 volatile int s_inFlight = 0;
+// Health bookkeeping (read from the loop task by healthy()):
+// s_rxActive counts IN transfers currently submitted. A transfer that errors
+// (or whose resubmit fails) goes idle and is counted OUT -- when all are idle
+// the device is deaf even though it still enumerates.
+volatile int s_rxActive = 0;
+// millis() when the current OUT transfer was submitted; 0 = none in flight.
+// A bulk OUT to a working device ACKs in <1 ms, so one sitting for seconds
+// means the device's USB controller has stopped servicing us.
+volatile uint32_t s_txSubmitMs = 0;
 
 // Flags set in the client event callback, acted on in the client task loop
 // (descriptor walking + claiming shouldn't run inside the callback).
@@ -104,10 +113,16 @@ void onTransferDone(usb_transfer_t* xfer) {
             memcpy(pkt.b, p, 4);
             xQueueSend(s_queue, &pkt, 0);  // full queue: drop, never block
         }
-        if (usb_host_transfer_submit(xfer) == ESP_OK) s_inFlight++;
+        if (usb_host_transfer_submit(xfer) == ESP_OK) {
+            s_inFlight++;
+            return;
+        }
     }
-    // Any error status (NO_DEVICE on unplug, stall, ...): leave it idle;
-    // cleanup or the next device claim will resubmit.
+    // Any error status (NO_DEVICE on unplug, stall, ...) or a failed
+    // resubmit: leave it idle -- cleanup or the next device claim will
+    // resubmit -- but COUNT it out of the active RX set so healthy() can see
+    // a deaf-but-attached pipeline (pre-1.2.0 this state was silent forever).
+    if (s_rxActive > 0) s_rxActive--;
 }
 
 // TX runs entirely in the client task (its loop and transfer callbacks), so
@@ -123,6 +138,7 @@ void serviceTx() {
     s_txXfer->num_bytes = n;
     if (usb_host_transfer_submit(s_txXfer) == ESP_OK) {
         s_txInFlight = true;
+        s_txSubmitMs = millis();
         s_inFlight++;
     }
 }
@@ -130,6 +146,7 @@ void serviceTx() {
 void onTxDone(usb_transfer_t* xfer) {
     s_inFlight--;
     s_txInFlight = false;
+    s_txSubmitMs = 0;
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_txDone += xfer->actual_num_bytes / 4;
         serviceTx();  // keep draining if more queued up meanwhile
@@ -251,8 +268,12 @@ void attachDevice(uint8_t addr) {
     }
     s_connected = true;
     snprintf(s_statusText, sizeof(s_statusText), "connected: \"%s\"", s_productName);
+    s_rxActive = 0;
     for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
-        if (usb_host_transfer_submit(s_xfers[i]) == ESP_OK) s_inFlight++;
+        if (usb_host_transfer_submit(s_xfers[i]) == ESP_OK) {
+            s_inFlight++;
+            s_rxActive++;
+        }
     }
     Serial.printf("[usb] MIDI interface %u claimed, IN ep 0x%02x -- listening\n", s_ifaceNum,
                   s_epIn);
@@ -281,8 +302,10 @@ void detachDevice() {
         s_txXfer = nullptr;
     }
     s_txInFlight = false;
+    s_txSubmitMs = 0;
     if (s_txQueue) xQueueReset(s_txQueue);
     s_inFlight = 0;
+    s_rxActive = 0;
     s_epIn = 0;
     s_epOut = 0;
     s_productName[0] = '\0';
@@ -456,6 +479,14 @@ uint32_t UsbMidi::txPacketCount() {
 
 bool UsbMidi::deviceConnected() {
     return s_connected;
+}
+
+bool UsbMidi::healthy() {
+    if (!s_connected) return false;
+    if (s_rxActive <= 0) return false;  // IN pipeline errored idle: deaf device
+    const uint32_t sub = s_txSubmitMs;
+    if (sub != 0 && millis() - sub > 2000) return false;  // OUT unACKed: wedged
+    return true;
 }
 
 const char* UsbMidi::deviceName() {

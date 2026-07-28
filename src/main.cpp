@@ -64,6 +64,7 @@ void loop() {
     }
     RtpMidi::tick();
     MidiBridge::tick();
+    MidiBridge::healthTick();
     WebUi::tick();
     BootGuard::tick();
     factoryResetTick();
