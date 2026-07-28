@@ -4,6 +4,7 @@
 #include "config.h"
 #include "rtp_midi.h"
 #include "status_led.h"
+#include "usb_midi_host.h"
 #include "web_ui.h"
 #include "wifi_net.h"
 
@@ -49,6 +50,7 @@ void setup() {
     Config::load();
     WifiNet::begin(Config::get().wifiSsid.c_str(), Config::get().wifiPass.c_str(), HOSTNAME);
     WebUi::begin();
+    UsbMidi::begin();
 }
 
 void loop() {
@@ -60,6 +62,7 @@ void loop() {
         RtpMidi::begin();
     }
     RtpMidi::tick();
+    UsbMidi::tick();
     WebUi::tick();
     BootGuard::tick();
     factoryResetTick();

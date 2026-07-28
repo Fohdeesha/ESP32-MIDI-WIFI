@@ -7,6 +7,7 @@
 #include "boot_guard.h"
 #include "config.h"
 #include "rtp_midi.h"
+#include "usb_midi_host.h"
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.0.0-dev"
@@ -43,15 +44,31 @@ button{margin-top:1em;padding:.5em 1.4em;background:#2a6;border:0;border-radius:
 </style></head><body><h1>ESP32-MIDI-WIFI</h1>
 )html";
 
+String htmlEscape(const String& in);
+
 String statusSection() {
     String s = F("<h2>Status</h2><table>");
     s += "<tr><td>Firmware</td><td>v" FW_VERSION "</td></tr>";
     s += "<tr><td>IP</td><td>" + WiFi.localIP().toString() + "</td></tr>";
     s += "<tr><td>RSSI</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
     s += "<tr><td>RTP-MIDI peers</td><td>" + String(RtpMidi::peerCount()) + "</td></tr>";
+    s += "<tr><td>USB MIDI</td><td>" + htmlEscape(UsbMidi::statusText()) + "</td></tr>";
+    s += "<tr><td>USB events</td><td>" + String(UsbMidi::eventCount()) + "</td></tr>";
     s += "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>";
     s += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " kB</td></tr>";
     s += F("</table>");
+    if (UsbMidi::eventCount() > 0) {
+        String ev;
+        UsbMidi::appendRecentEvents(ev, "\n");
+        s += F("<p><small>Recent MIDI events (reload to refresh):</small></p><pre>");
+        s += htmlEscape(ev);
+        s += F("</pre>");
+    }
+    if (UsbMidi::descriptorDump()[0]) {
+        s += F("<details class='nets'><summary>USB descriptors</summary><pre>");
+        s += htmlEscape(UsbMidi::descriptorDump());
+        s += F("</pre></details>");
+    }
     return s;
 }
 
