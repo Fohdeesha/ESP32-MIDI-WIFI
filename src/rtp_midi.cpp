@@ -5,6 +5,7 @@
 #include <WiFi.h>
 
 #include "config.h"
+#include "midi_bridge.h"
 #include "status_led.h"
 
 // Defines global session + MIDI interface objects (AppleMIDI, MIDI).
@@ -28,6 +29,19 @@ void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/) {
     Serial.printf("[rtp] peer disconnected (peers: %d)\n", s_peerCount);
     if (s_peerCount == 0) StatusLed::set(LedStatus::WifiConnected);
 }
+
+// Incoming MIDI from the RTP peer, handed to the bridge (RTP -> USB).
+// These fire inside MIDI.read() in tick(), i.e. loop context.
+void onRxNoteOn(byte ch, byte note, byte vel) { MidiBridge::rtpNoteOn(ch, note, vel); }
+void onRxNoteOff(byte ch, byte note, byte vel) { MidiBridge::rtpNoteOff(ch, note, vel); }
+void onRxControlChange(byte ch, byte num, byte val) { MidiBridge::rtpControlChange(ch, num, val); }
+void onRxProgramChange(byte ch, byte num) { MidiBridge::rtpProgramChange(ch, num); }
+void onRxAfterTouch(byte ch, byte pressure) { MidiBridge::rtpAfterTouch(ch, pressure); }
+void onRxAfterTouchPoly(byte ch, byte note, byte pressure) {
+    MidiBridge::rtpAfterTouchPoly(ch, note, pressure);
+}
+void onRxPitchBend(byte ch, int bend) { MidiBridge::rtpPitchBend(ch, bend); }
+void onRxSysEx(byte* data, unsigned size) { MidiBridge::rtpSysEx(data, (uint16_t)size); }
 }  // namespace
 
 void RtpMidi::begin() {
@@ -35,6 +49,14 @@ void RtpMidi::begin() {
     AppleMIDI.setName(Config::get().sessionName.c_str());
     AppleMIDI.setHandleConnected(onPeerConnected);
     AppleMIDI.setHandleDisconnected(onPeerDisconnected);
+    MIDI.setHandleNoteOn(onRxNoteOn);
+    MIDI.setHandleNoteOff(onRxNoteOff);
+    MIDI.setHandleControlChange(onRxControlChange);
+    MIDI.setHandleProgramChange(onRxProgramChange);
+    MIDI.setHandleAfterTouchChannel(onRxAfterTouch);
+    MIDI.setHandleAfterTouchPoly(onRxAfterTouchPoly);
+    MIDI.setHandlePitchBend(onRxPitchBend);
+    MIDI.setHandleSystemExclusive(onRxSysEx);
     MIDI.begin(MIDI_CHANNEL_OMNI);
     started = true;
     Serial.printf("[rtp] session \"%s\" listening on UDP 5004/5005\n",

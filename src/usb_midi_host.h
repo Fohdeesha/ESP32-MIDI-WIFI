@@ -13,6 +13,10 @@ void begin();
 // to serial + the web UI's event ring). Returns false when the queue is
 // empty. Call from loop context only.
 bool readPacket(uint8_t out[4]);
+// Queues one 4-byte USB-MIDI event packet for transmission to the device.
+// Returns false when no device is attached or the TX queue is full.
+bool writePacket(const uint8_t pkt[4]);
+uint32_t txPacketCount();  // packets confirmed delivered on the wire
 bool deviceConnected();
 const char* deviceName();  // product string of the attached device, "" if none
 const char* statusText();  // human-readable host state for the web UI

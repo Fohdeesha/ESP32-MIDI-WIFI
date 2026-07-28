@@ -5,8 +5,7 @@
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
 
-// USB -> network direction only for now. The reverse direction (RTP in ->
-// USB out) is 0.7.0.
+// USB -> network direction first, RTP -> USB below.
 namespace {
 
 // Only the P1-M's first virtual MIDI cable carries the control surface;
@@ -98,4 +97,67 @@ void MidiBridge::tick() {
 
 uint32_t MidiBridge::forwardedCount() {
     return s_forwarded;
+}
+
+// ---- RTP -> USB (0.7.0) ----------------------------------------------------
+// Everything goes out on virtual cable 0, mirroring the inbound filter.
+
+namespace {
+uint32_t s_returned = 0;
+
+void usbSend(uint8_t cin, uint8_t status, uint8_t d1, uint8_t d2) {
+    uint8_t pkt[4] = {cin, status, d1, d2};  // cable 0: high nibble stays 0
+    if (UsbMidi::writePacket(pkt)) s_returned++;
+}
+}  // namespace
+
+void MidiBridge::rtpNoteOn(uint8_t ch, uint8_t note, uint8_t vel) {
+    usbSend(0x9, 0x90 | (ch - 1), note, vel);
+}
+
+void MidiBridge::rtpNoteOff(uint8_t ch, uint8_t note, uint8_t vel) {
+    usbSend(0x8, 0x80 | (ch - 1), note, vel);
+}
+
+void MidiBridge::rtpControlChange(uint8_t ch, uint8_t controller, uint8_t value) {
+    usbSend(0xB, 0xB0 | (ch - 1), controller, value);
+}
+
+void MidiBridge::rtpProgramChange(uint8_t ch, uint8_t program) {
+    usbSend(0xC, 0xC0 | (ch - 1), program, 0);
+}
+
+void MidiBridge::rtpAfterTouch(uint8_t ch, uint8_t pressure) {
+    usbSend(0xD, 0xD0 | (ch - 1), pressure, 0);
+}
+
+void MidiBridge::rtpAfterTouchPoly(uint8_t ch, uint8_t note, uint8_t pressure) {
+    usbSend(0xA, 0xA0 | (ch - 1), note, pressure);
+}
+
+void MidiBridge::rtpPitchBend(uint8_t ch, int value) {
+    uint16_t v = (uint16_t)(value + 8192);
+    usbSend(0xE, 0xE0 | (ch - 1), v & 0x7F, (v >> 7) & 0x7F);
+}
+
+void MidiBridge::rtpSysEx(const uint8_t* data, uint16_t length) {
+    // Chunk into 3-byte packets: CIN 0x4 continues, 0x5/0x6/0x7 end with
+    // 1/2/3 bytes. Counted as one event regardless of packet count.
+    if (length < 2) return;
+    bool ok = true;
+    uint16_t i = 0;
+    while (length - i > 3) {
+        uint8_t pkt[4] = {0x4, data[i], data[i + 1], data[i + 2]};
+        ok &= UsbMidi::writePacket(pkt);
+        i += 3;
+    }
+    uint8_t rem = length - i;
+    uint8_t pkt[4] = {(uint8_t)(0x4 + rem), 0, 0, 0};
+    memcpy(&pkt[1], &data[i], rem);
+    ok &= UsbMidi::writePacket(pkt);
+    if (ok) s_returned++;
+}
+
+uint32_t MidiBridge::returnedCount() {
+    return s_returned;
 }

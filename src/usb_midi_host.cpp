@@ -28,8 +28,14 @@ QueueHandle_t s_queue = nullptr;
 
 uint8_t s_ifaceNum = 0;
 uint8_t s_ifaceAlt = 0;
-uint8_t s_epIn = 0;  // IN endpoint address; 0 = no MIDI interface found
+uint8_t s_epIn = 0;   // IN endpoint address; 0 = no MIDI interface found
+uint8_t s_epOut = 0;  // OUT endpoint address; 0 = device has no MIDI input
+uint16_t s_epOutMps = 64;
 usb_transfer_t* s_xfers[NUM_RX_TRANSFERS] = {};
+usb_transfer_t* s_txXfer = nullptr;
+QueueHandle_t s_txQueue = nullptr;
+bool s_txInFlight = false;  // touched only from the client task
+uint32_t s_txDone = 0;
 volatile int s_inFlight = 0;
 
 // Flags set in the client event callback, acted on in the client task loop
@@ -103,8 +109,34 @@ void onTransferDone(usb_transfer_t* xfer) {
     // cleanup or the next device claim will resubmit.
 }
 
+// TX runs entirely in the client task (its loop and transfer callbacks), so
+// none of it needs locking; writers only touch the TX queue + unblock.
+void serviceTx() {
+    if (!s_connected || !s_txXfer || s_txInFlight) return;
+    int n = 0;
+    while (n + 4 <= s_epOutMps &&
+           xQueueReceive(s_txQueue, s_txXfer->data_buffer + n, 0) == pdTRUE) {
+        n += 4;
+    }
+    if (n == 0) return;
+    s_txXfer->num_bytes = n;
+    if (usb_host_transfer_submit(s_txXfer) == ESP_OK) {
+        s_txInFlight = true;
+        s_inFlight++;
+    }
+}
+
+void onTxDone(usb_transfer_t* xfer) {
+    s_inFlight--;
+    s_txInFlight = false;
+    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+        s_txDone += xfer->actual_num_bytes / 4;
+        serviceTx();  // keep draining if more queued up meanwhile
+    }
+}
+
 // Walks the active config descriptor for the first MIDIStreaming interface
-// and its IN endpoint. Returns false if the device has no MIDI function.
+// and its endpoints. Returns false if the device has no MIDI IN function.
 bool findMidiInterface() {
     const usb_config_desc_t* cfg = nullptr;
     if (usb_host_get_active_config_descriptor(s_device, &cfg) != ESP_OK) return false;
@@ -122,11 +154,12 @@ bool findMidiInterface() {
                 s_ifaceNum = id->bInterfaceNumber;
                 s_ifaceAlt = id->bAlternateSetting;
             }
-        } else if (p[1] == USB_B_DESCRIPTOR_TYPE_ENDPOINT && inMidiIface && s_epIn == 0) {
+        } else if (p[1] == USB_B_DESCRIPTOR_TYPE_ENDPOINT && inMidiIface) {
             const usb_ep_desc_t* ed = (const usb_ep_desc_t*)p;
             uint8_t type = ed->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK;
-            if ((ed->bEndpointAddress & 0x80) &&
-                (type == USB_BM_ATTRIBUTES_XFER_BULK || type == USB_BM_ATTRIBUTES_XFER_INT)) {
+            bool usable =
+                (type == USB_BM_ATTRIBUTES_XFER_BULK || type == USB_BM_ATTRIBUTES_XFER_INT);
+            if (usable && (ed->bEndpointAddress & 0x80) && s_epIn == 0) {
                 s_epIn = ed->bEndpointAddress;
                 for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
                     if (!s_xfers[i]) usb_host_transfer_alloc(ed->wMaxPacketSize, 0, &s_xfers[i]);
@@ -136,6 +169,14 @@ bool findMidiInterface() {
                     s_xfers[i]->callback = onTransferDone;
                     s_xfers[i]->context = nullptr;
                 }
+            } else if (usable && !(ed->bEndpointAddress & 0x80) && s_epOut == 0) {
+                s_epOut = ed->bEndpointAddress;
+                s_epOutMps = ed->wMaxPacketSize;
+                if (!s_txXfer) usb_host_transfer_alloc(s_epOutMps, 0, &s_txXfer);
+                s_txXfer->device_handle = s_device;
+                s_txXfer->bEndpointAddress = s_epOut;
+                s_txXfer->callback = onTxDone;
+                s_txXfer->context = nullptr;
             }
         }
         p += p[0];
@@ -234,8 +275,15 @@ void detachDevice() {
             s_xfers[i] = nullptr;
         }
     }
+    if (s_txXfer) {
+        usb_host_transfer_free(s_txXfer);
+        s_txXfer = nullptr;
+    }
+    s_txInFlight = false;
+    if (s_txQueue) xQueueReset(s_txQueue);
     s_inFlight = 0;
     s_epIn = 0;
+    s_epOut = 0;
     s_productName[0] = '\0';
     snprintf(s_statusText, sizeof(s_statusText), "host active, no device");
     Serial.println("[usb] device disconnected");
@@ -251,7 +299,9 @@ void onClientEvent(const usb_host_client_event_msg_t* msg, void* /*arg*/) {
 
 void clientTask(void*) {
     while (true) {
-        usb_host_client_handle_events(s_client, portMAX_DELAY);
+        // Finite timeout as a TX-service backstop; writePacket() also calls
+        // usb_host_client_unblock() so queued TX goes out immediately.
+        usb_host_client_handle_events(s_client, pdMS_TO_TICKS(50));
         if (s_pendingGone) {
             s_pendingGone = false;
             detachDevice();
@@ -261,6 +311,7 @@ void clientTask(void*) {
             s_pendingAddr = 0;
             attachDevice(addr);
         }
+        serviceTx();
     }
 }
 
@@ -330,6 +381,7 @@ bool formatPacket(const MidiPacket& p, char* buf, size_t len) {
 
 void UsbMidi::begin() {
     s_queue = xQueueCreate(128, sizeof(MidiPacket));
+    s_txQueue = xQueueCreate(128, sizeof(MidiPacket));
 
     usb_host_config_t hostCfg = {};
     hostCfg.skip_phy_setup = false;
@@ -374,6 +426,17 @@ bool UsbMidi::readPacket(uint8_t out[4]) {
     }
     memcpy(out, pkt.b, 4);
     return true;
+}
+
+bool UsbMidi::writePacket(const uint8_t pkt[4]) {
+    if (!s_connected || !s_epOut || !s_txQueue) return false;
+    if (xQueueSend(s_txQueue, pkt, 0) != pdTRUE) return false;
+    usb_host_client_unblock(s_client);  // wake the client task to send now
+    return true;
+}
+
+uint32_t UsbMidi::txPacketCount() {
+    return s_txDone;
 }
 
 bool UsbMidi::deviceConnected() {
