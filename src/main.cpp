@@ -51,7 +51,7 @@ void setup() {
     Config::load();
     WifiNet::begin(Config::get(), HOSTNAME);
     WebUi::begin();
-    MidiBridge::begin(Config::get().usbCable);
+    MidiBridge::begin(Config::get().usbCable, Config::get().usbCableOut);
     UsbMidi::begin(Config::get().usbIface);
 }
 

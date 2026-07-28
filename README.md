@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.3.0**
+**Current version: 1.4.0**
 
 ## How it works
 
@@ -30,7 +30,7 @@ The bridge is fully bidirectional: notes and controls flow from the USB device
 to the network, and network MIDI flows back to the device (LEDs, motorized
 faders, displays on control surfaces). SysEx is chunked and reassembled
 correctly in both directions. Which of the device's MIDI ports is bridged is
-configurable (default: the first one).
+configurable per direction (default: the first port, both ways).
 
 ## Features
 
@@ -39,9 +39,11 @@ configurable (default: the first one).
   size on a full-speed link).
 - **Selectable MIDI port**: multi-port devices present several virtual cables
   (and occasionally several MIDI interfaces) — pick which one to bridge from
-  the web UI, or merge them all. The picker lists what the attached device
+  the web UI, separately per direction if a device needs it, or merge every
+  incoming port into one stream. The picker lists what the attached device
   actually presents, with live per-port event counters so you can tell which
-  port your controller is really using.
+  port your controller is really using, and warns if a selected port is beyond
+  what the device declares in that direction.
 - **Bidirectional RTP-MIDI bridge** hardened for sustained high-rate traffic
   (large parse buffer so no datagram straddles reads, deep TX queue with
   backpressure so device-bound SysEx bursts don't tear).
@@ -140,14 +142,22 @@ Everything is set from the web UI:
   it declares in each direction. A saved selection that isn't on the currently
   attached device falls back to the first usable one, and the status line says
   so rather than silently going quiet.
-- **USB MIDI port to bridge**: which of the device's virtual cables (the
-  "ports" a DAW would list — MIDI 1, MIDI 2, …) to bridge. Defaults to port 1.
-  Ports the device declares are marked, and any port that has carried traffic
-  shows its event count, so you can identify the right one even for devices
-  whose descriptors understate what they have. RTP-MIDI carries no port
-  number, so one port is bridged in both directions; *All ports* merges every
-  incoming port into the single network stream and sends network → device
-  traffic on port 1. Changes take effect after the reboot that saving
+- **USB MIDI port, device → network**: which of the device's virtual cables
+  (the "ports" a DAW would list — MIDI 1, MIDI 2, …) to forward to the
+  network. Defaults to port 1. Ports the device declares are marked, and any
+  port that has carried traffic shows its event count, so you can identify the
+  right one even for devices whose descriptors understate what they have.
+  *All ports* merges every incoming port into the single network stream.
+- **USB MIDI port, network → device**: where network MIDI is sent on the
+  device. Defaults to *same as the port above*, which is what a control
+  surface needs — it expects its LEDs and faders back on the port it sent
+  from. Set it explicitly for the two cases where the directions differ: a
+  device that declares a different number of ports each way, and *All ports*
+  in the other direction (a merged input has no single port for the return
+  path to follow). The page warns if either selection is beyond what the
+  device declares for that direction.
+
+  Changes to any of the three take effect after the reboot that saving
   triggers.
 - **Static IP**: leave blank for DHCP, or set address, subnet mask, gateway
   (optional), and DNS (optional, defaults to the gateway). Inputs are
@@ -163,6 +173,14 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.4.0 — the bridged port is now selectable per direction. The network → device
+  port defaults to following the device → network one (what a control surface
+  needs), and can be set independently for the two cases where that isn't
+  right: devices that declare a different number of ports in each direction,
+  and "all ports" merged inbound, which leaves the return path no single port
+  to follow. Each port list is annotated from the descriptors for its own
+  direction, and the page warns when a selection is beyond what the device
+  declares that way
 - 1.3.0 — selectable MIDI port: which MIDI function of the attached device
   (MIDIStreaming interface) and which of its up to 16 virtual cables get
   bridged are now set from the web UI, instead of being fixed at the first

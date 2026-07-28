@@ -18,11 +18,18 @@ struct Values {
     // device can present several MIDIStreaming interfaces, and each interface
     // can carry up to 16 virtual cables (the "ports" a DAW would list).
     uint8_t usbIface;  // bInterfaceNumber to claim; IFACE_AUTO = first usable
-    uint8_t usbCable;  // virtual cable to bridge; CABLE_ALL = all, merged
+    uint8_t usbCable;  // device->network cable; CABLE_ALL = all, merged
+    // network->device cable. Its own setting because a device's in and out
+    // cable counts are independent in the descriptors, and "all ports in" has
+    // no single cable for the return path to follow. CABLE_SAME (the default)
+    // keeps the two directions locked together, which is what a control
+    // surface needs -- it expects its LEDs back on the port it sent from.
+    uint8_t usbCableOut;
 };
 
 constexpr uint8_t IFACE_AUTO = 0xFF;
-constexpr uint8_t CABLE_ALL = 0xFF;
+constexpr uint8_t CABLE_ALL = 0xFF;   // input only
+constexpr uint8_t CABLE_SAME = 0xFE;  // output only: follow the input setting
 
 // Loads NVS-stored values; anything unset gets a safe default (no baked-in
 // credentials -- a blank config boots into the setup AP portal).

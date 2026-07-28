@@ -16,9 +16,9 @@ namespace {
 // RTP-MIDI has no cable concept, so exactly one is bridged unless the user
 // asks for CABLE_ALL and accepts that they arrive merged.
 uint8_t s_cable = 0;
-// High nibble stamped on device-bound packets. With CABLE_ALL there is no one
-// right answer for the reverse direction, so it goes to cable 0 -- the cable
-// every compliant device implements.
+// Cable for the network->device direction, resolved from config, and the same
+// value pre-shifted into the high nibble stamped on outgoing packets.
+uint8_t s_outCable = 0;
 uint8_t s_outNibble = 0;
 
 uint32_t s_forwarded = 0;
@@ -51,18 +51,29 @@ void sysexEnd(const uint8_t* bytes, uint8_t n) {
 
 }  // namespace
 
-void MidiBridge::begin(uint8_t cable) {
+void MidiBridge::begin(uint8_t cable, uint8_t outCable) {
     s_cable = (cable == Config::CABLE_ALL || cable <= 15) ? cable : 0;
-    s_outNibble = s_cable == Config::CABLE_ALL ? 0 : (uint8_t)(s_cable << 4);
+    // Anything not an explicit cable means "follow the input". Merging every
+    // input cable leaves no single one to follow, so that resolves to cable 0
+    // -- the cable every compliant device implements.
+    s_outCable = outCable <= 15 ? outCable
+                                : (s_cable == Config::CABLE_ALL ? 0 : s_cable);
+    s_outNibble = (uint8_t)(s_outCable << 4);
     if (s_cable == Config::CABLE_ALL) {
-        Serial.println("[bridge] bridging all virtual cables (merged); output on cable 0");
+        Serial.printf("[bridge] bridging all virtual cables in (merged), cable %u out\n",
+                      s_outCable);
     } else {
-        Serial.printf("[bridge] bridging virtual cable %u only\n", s_cable);
+        Serial.printf("[bridge] bridging virtual cable %u in, cable %u out\n", s_cable,
+                      s_outCable);
     }
 }
 
 uint8_t MidiBridge::bridgedCable() {
     return s_cable;
+}
+
+uint8_t MidiBridge::outputCable() {
+    return s_outCable;
 }
 
 void MidiBridge::tick() {

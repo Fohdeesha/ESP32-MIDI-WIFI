@@ -55,8 +55,30 @@ String portLabel(uint8_t cable) {
 }
 
 String bridgedPortText() {
-    uint8_t c = MidiBridge::bridgedCable();
-    return c == Config::CABLE_ALL ? String("all ports merged") : portLabel(c) + " only";
+    uint8_t in = MidiBridge::bridgedCable();
+    String s = in == Config::CABLE_ALL ? String("all ports merged") : portLabel(in);
+    return s + " in, " + portLabel(MidiBridge::outputCable()) + " out";
+}
+
+// Flags a selection pointing at a cable the attached device doesn't declare in
+// that direction -- the asymmetric case (a device's in and out cable counts are
+// independent) that would otherwise be silently dead in one direction.
+String portWarning() {
+    UsbMidi::IfaceInfo f;
+    if (!UsbMidi::claimedInterfaceInfo(f)) return String();
+    String w;
+    uint8_t in = MidiBridge::bridgedCable();
+    uint8_t out = MidiBridge::outputCable();
+    if (f.inCables && in != Config::CABLE_ALL && in >= f.inCables) {
+        w += "The device declares only " + String(f.inCables) +
+             " port(s) toward the network, so nothing will arrive on " + portLabel(in) + ". ";
+    }
+    if (f.outCables && out >= f.outCables) {
+        w += "The device declares only " + String(f.outCables) +
+             " port(s) from the network, so anything sent to " + portLabel(out) +
+             " will be ignored. ";
+    }
+    return w;
 }
 
 String statusSection() {
@@ -212,23 +234,32 @@ String usbIfaceOptions(uint8_t sel) {
 
 // All 16 cables are always offered: descriptors are not always honest about
 // how many a device has, so observed traffic is annotated alongside the
-// declared count and the user can pick any of them.
-String usbCableOptions(uint8_t sel) {
+// declared count and the user can pick any of them. The declared count is read
+// per direction -- a device's in and out cable counts are independent, which is
+// the whole reason the output port is its own setting.
+String usbCableOptions(uint8_t sel, bool output) {
     UsbMidi::IfaceInfo f;
     uint8_t declared = 0;
-    if (UsbMidi::claimedInterfaceInfo(f)) {
-        declared = f.inCables > f.outCables ? f.inCables : f.outCables;
+    if (UsbMidi::claimedInterfaceInfo(f)) declared = output ? f.outCables : f.inCables;
+    String o;
+    if (output) {
+        o = F("<option value='254'");
+        if (sel == Config::CABLE_SAME) o += F(" selected");
+        o += F(">Same as the port above</option>");
+    } else {
+        o = F("<option value='255'");
+        if (sel == Config::CABLE_ALL) o += F(" selected");
+        o += F(">All ports, merged into one stream</option>");
     }
-    String o = F("<option value='255'");
-    if (sel == Config::CABLE_ALL) o += F(" selected");
-    o += F(">All ports, merged into one stream</option>");
     for (uint8_t c = 0; c < 16; c++) {
         o += "<option value='" + String(c) + "'";
         if (sel == c) o += F(" selected");
         o += ">Port " + String(c + 1) + " (cable " + String(c) + ")";
         if (declared && c < declared) o += F(" &mdash; on the device");
-        uint32_t seen = UsbMidi::cableRxCount(c);
-        if (seen) o += " &mdash; " + String(seen) + " events seen";
+        if (!output) {  // inbound traffic is evidence; outbound is our own doing
+            uint32_t seen = UsbMidi::cableRxCount(c);
+            if (seen) o += " &mdash; " + String(seen) + " events seen";
+        }
         o += F("</option>");
     }
     return o;
@@ -259,16 +290,31 @@ void handleRoot() {
               "claim)</small></label><select name='uif'>");
     page += usbIfaceOptions(c.usbIface);
     page += F("</select>"
-              "<label>USB MIDI port to bridge <small>(a device's virtual cables are the "
-              "ports a DAW would list)</small></label><select name='ucab'>");
-    page += usbCableOptions(c.usbCable);
+              "<label>USB MIDI port, device &rarr; network <small>(a device's virtual "
+              "cables are the ports a DAW would list)</small></label><select name='ucab'>");
+    page += usbCableOptions(c.usbCable, false);
+    page += F("</select>"
+              "<label>USB MIDI port, network &rarr; device <small>(leave on \"same as "
+              "above\" unless the device is asymmetric)</small></label>"
+              "<select name='ucabo'>");
+    page += usbCableOptions(c.usbCableOut, true);
     page += F("</select><p><small>Currently bridging ");
     page += bridgedPortText();
-    page += F(". RTP-MIDI carries no port number, so one port is bridged in both "
-              "directions; \"all ports\" merges everything device&rarr;network and sends "
-              "network&rarr;device on port 1. Plug the device in and reload to see which "
-              "ports it presents and which are carrying traffic.</small></p>"
-              "<label>Static IP <small>(blank = DHCP)</small></label>"
+    page += F(". RTP-MIDI carries no port number, so one port is bridged per direction, "
+              "normally the same one &mdash; a control surface expects its LEDs back on the "
+              "port it sent from. \"All ports\" merges every incoming port; with it the "
+              "return path has no port to follow, so pick one explicitly. Plug the device "
+              "in and reload to see which ports it presents and which are carrying "
+              "traffic.</small></p>");
+    {
+        String w = portWarning();
+        if (w.length()) {
+            page += F("<p><small class='warn'>");
+            page += w;
+            page += F("</small></p>");
+        }
+    }
+    page += F("<label>Static IP <small>(blank = DHCP)</small></label>"
               "<input type='text' name='sip' value='");
     page += htmlEscape(c.staticIp);
     page += F("'><label>Subnet mask</label><input type='text' name='smask' value='");
@@ -357,10 +403,21 @@ void handleConfigPost() {
         const String& a = server.arg("ucab");
         long n = a.toInt();
         if (!allDigits(a) || !(n <= 15 || n == Config::CABLE_ALL)) {
-            server.send(400, "text/html", "Not saved: invalid USB MIDI port.");
+            server.send(400, "text/html", "Not saved: invalid USB MIDI input port.");
             return;
         }
         v.usbCable = (uint8_t)n;
+    }
+    if (server.hasArg("ucabo")) {
+        const String& a = server.arg("ucabo");
+        long n = a.toInt();
+        // CABLE_ALL is meaningless outbound: sending to every cable at once
+        // would just multiply traffic to the device.
+        if (!allDigits(a) || !(n <= 15 || n == Config::CABLE_SAME)) {
+            server.send(400, "text/html", "Not saved: invalid USB MIDI output port.");
+            return;
+        }
+        v.usbCableOut = (uint8_t)n;
     }
     // Static IP block: validate before saving anything -- a bad value that
     // slipped into NVS would only surface as an unreachable device.

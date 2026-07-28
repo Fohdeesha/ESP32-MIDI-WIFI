@@ -28,6 +28,10 @@ void Config::load() {
     values.usbIface = prefs.getUChar("uif", IFACE_AUTO);
     values.usbCable = prefs.getUChar("ucab", 0);
     if (values.usbCable > 15 && values.usbCable != CABLE_ALL) values.usbCable = 0;
+    values.usbCableOut = prefs.getUChar("ucabo", CABLE_SAME);
+    if (values.usbCableOut > 15 && values.usbCableOut != CABLE_SAME) {
+        values.usbCableOut = CABLE_SAME;
+    }
     prefs.end();
 }
 
@@ -45,6 +49,7 @@ bool Config::save(const Values& v) {
     prefs.putString("sdns", v.staticDns);
     prefs.putUChar("uif", v.usbIface);
     prefs.putUChar("ucab", v.usbCable);
+    prefs.putUChar("ucabo", v.usbCableOut);
     prefs.end();
     values = v;
     return true;
