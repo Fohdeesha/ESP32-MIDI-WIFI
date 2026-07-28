@@ -22,11 +22,13 @@
 // slow trickle of session commands (CK1 answers, invite OKs) for minutes:
 // sessions then die with MaxAttempts / NoResponseFromConnectionRequest over
 // and over until reboot -- the exact wedge a busy MIDI host's display load
-// exposes. With an MTU-sized buffer every datagram is parsed whole and the
-// parser state returns to idle at each datagram boundary, so a lost packet
-// costs only its own contents.
+// exposes. Sized so every datagram is parsed whole and the parser state
+// returns to idle at each datagram boundary, so a lost packet costs only its
+// own contents: 2048 covers the largest unfragmented UDP payload a 1500-byte
+// MTU allows (1472) with margin for lwIP handing up a small IP-reassembled
+// datagram, which would otherwise straddle the buffer the same way.
 struct EspMidiSettings : public APPLEMIDI_NAMESPACE::DefaultSettings {
-    static const size_t MaxBufferSize = 1536;
+    static const size_t MaxBufferSize = 2048;
 };
 using EspMidiSession = APPLEMIDI_NAMESPACE::AppleMIDISession<WiFiUDP, EspMidiSettings>;
 EspMidiSession AppleMIDI("ESP32-MIDI", 5004);
