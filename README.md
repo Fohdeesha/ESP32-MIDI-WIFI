@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.5.0**
+**Current version: 1.5.1**
 
 ## How it works
 
@@ -54,9 +54,9 @@ configurable per direction (default: the first port, both ways).
   initiate (and re-invite every 30 s until connected).
 - **Web config UI** (`http://esp32-midi.local/`): status, WiFi and network
   settings, RTP-MIDI session settings, MIDI port selection, password
-  management, factory reset, and a live diagnostics view (USB state, decoded
-  recent MIDI events in both directions with their port numbers, RTP-MIDI
-  session event log, USB descriptor dump).
+  management, factory reset, and a live diagnostics view in collapsible
+  sections (USB state, decoded recent MIDI events in both directions with their
+  port numbers, RTP-MIDI session event log, USB descriptor dump).
 - **Static IP or DHCP** (DHCP by default), configurable from the web UI with
   validation.
 - **OTA firmware updates** over HTTP — no serial connection needed once the
@@ -185,6 +185,13 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.5.1 — status page tidy-up: the three diagnostic logs (recent MIDI from the
+  device, recent MIDI to the device, RTP-MIDI session events) are now
+  collapsible sections that start closed, like the USB descriptor dump, so the
+  status table stays visible instead of being pushed off the top of the page by
+  a long session log. Log text is also rendered a little larger, the page picked
+  up a red accent for its title and buttons, and there is now an author/project
+  footer.
 - 1.5.0 — **large latency fix.** Under a sustained device-bound SysEx load (a
   control surface's displays), the main loop was collapsing from ~480 Hz to
   around 4 Hz, with single iterations as long as 240 ms. Incoming MIDI was then

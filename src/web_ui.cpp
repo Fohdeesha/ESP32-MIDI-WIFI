@@ -30,11 +30,13 @@ const char PAGE_HEAD[] PROGMEM = R"html(<!DOCTYPE html>
 <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32-MIDI-WIFI</title><style>
 body{font-family:system-ui,sans-serif;max-width:640px;margin:1em auto;padding:0 1em;background:#111;color:#ddd}
-h1{font-size:1.3em}h2{font-size:1.05em;margin-top:1.6em;border-bottom:1px solid #333;padding-bottom:.3em}
+h1{font-size:1.4em;color:#e0453a}h2{font-size:1.05em;margin-top:1.6em;border-bottom:1px solid #333;padding-bottom:.3em}
 table{border-collapse:collapse}td{padding:.15em .8em .15em 0;color:#aaa}td+td{color:#ddd}
 label{display:block;margin:.7em 0 .2em;color:#aaa}
 input[type=text],input[type=password],input[type=number],select{width:100%;box-sizing:border-box;padding:.45em;background:#222;border:1px solid #444;border-radius:4px;color:#ddd}
-button{margin-top:1em;padding:.5em 1.4em;background:#2a6;border:0;border-radius:4px;color:#fff;font-size:1em;cursor:pointer}
+/* White on #e0453a is 4.1:1 -- AA only as large text, hence 1.2em/700. */
+button{margin-top:1em;padding:.5em 1.4em;background:#e0453a;border:0;border-radius:4px;color:#fff;font-size:1.2em;font-weight:700;cursor:pointer}
+button:hover{background:#f2564a}button:active{background:#c53a30}
 .warn{color:#fa5}small{color:#888}
 .nets{margin:.5em 0;border:1px solid #333;border-radius:4px;padding:.2em .6em}
 .nets summary{cursor:pointer;color:#8cf;padding:.3em 0}
@@ -43,6 +45,10 @@ button{margin-top:1em;padding:.5em 1.4em;background:#2a6;border:0;border-radius:
 .nets tr:hover td{background:#222}
 .nets td{padding:.35em .6em;border-bottom:1px solid #2a2a2a;color:#ddd}
 .nets td.rssi{text-align:right;color:#888;white-space:nowrap;width:6em}
+.nets pre{font-size:1em;line-height:1.35;margin:.4em 0 .6em;overflow-x:auto}
+.nets small{display:block;margin:.3em 0 .1em}
+.foot{margin-top:2.2em;border-top:1px solid #333;padding-top:.8em;color:#888;font-size:.9em}
+.foot a{color:#e0453a;text-decoration:none}.foot a:hover{text-decoration:underline}
 </style></head><body><h1>ESP32-MIDI-WIFI</h1>
 )html";
 
@@ -104,28 +110,31 @@ String statusSection() {
     s += "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>";
     s += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " kB</td></tr>";
     s += F("</table>");
+    // The log rings are long and only wanted when something is being diagnosed,
+    // so they collapse like the descriptor dump rather than pushing the status
+    // table off the top of the page.
     if (UsbMidi::eventCount() > 0) {
         String ev;
         UsbMidi::appendRecentEvents(ev, "\n");
-        s += F("<p><small>Recent MIDI from the device, cN = virtual cable "
-               "(reload to refresh):</small></p><pre>");
+        s += F("<details class='nets'><summary>Recent MIDI from the device</summary>"
+               "<small>cN = virtual cable (reload to refresh)</small><pre>");
         s += htmlEscape(ev);
-        s += F("</pre>");
+        s += F("</pre></details>");
     }
     if (UsbMidi::txFormattedCount() > 0) {
         String ev;
         UsbMidi::appendRecentTxEvents(ev, "\n");
-        s += F("<p><small>Recent MIDI to the device:</small></p><pre>");
+        s += F("<details class='nets'><summary>Recent MIDI to the device</summary><pre>");
         s += htmlEscape(ev);
-        s += F("</pre>");
+        s += F("</pre></details>");
     }
     {
         String ev;
         RtpMidi::appendEventLog(ev, "\n");
         if (ev.length()) {
-            s += F("<p><small>RTP-MIDI session events:</small></p><pre>");
+            s += F("<details class='nets'><summary>RTP-MIDI session events</summary><pre>");
             s += htmlEscape(ev);
-            s += F("</pre>");
+            s += F("</pre></details>");
         }
     }
     if (UsbMidi::descriptorDump()[0]) {
@@ -361,6 +370,9 @@ void handleRoot() {
               "<p><small>Also available without the password: hold the BOOT button "
               "for 10 seconds.</small></p>"
               "<p><small>Device reboots after saving config, flashing firmware, or resetting.</small></p>"
+              "<div class='foot'>Author: Jon Sands &mdash; "
+              "<a href='https://github.com/Fohdeesha/ESP32-MIDI-WIFI'>"
+              "github.com/Fohdeesha/ESP32-MIDI-WIFI</a></div>"
               "</body></html>");
     server.send(200, "text/html", page);
 }
