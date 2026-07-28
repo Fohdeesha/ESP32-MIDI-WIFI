@@ -92,7 +92,15 @@ bool RtpMidi::isStarted() {
 
 void RtpMidi::tick() {
     if (!started) return;
-    MIDI.read();
+    // Drain every pending message, not one per loop: the AppleMIDI library's
+    // available() returns early while its parsed-message buffer is non-empty,
+    // skipping socket reads AND initiator clock-sync management on that path.
+    // At one read() per loop a busy MIDI host's display/fader stream keeps
+    // the buffer full, CK0/CK1 sync starves, and the library ends the session
+    // (BY) after MaxSynchronizationCK0Attempts (~60 s). The bound keeps a
+    // flood from starving WiFi/web handling in loop().
+    for (int i = 0; i < 128 && MIDI.read(); i++) {
+    }
     inviteTick();
 }
 
