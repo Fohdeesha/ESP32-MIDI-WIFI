@@ -405,7 +405,7 @@ bool formatPacket(const MidiPacket& p, char* buf, size_t len) {
 
 void UsbMidi::begin() {
     s_queue = xQueueCreate(128, sizeof(MidiPacket));
-    // Sized for the EGM bridge's ~10 s full surface re-assert: one burst is
+    // Sized for a busy host's ~10 s full surface re-assert: one burst is
     // 300+ event packets (32 display cells as chunked sysex + every LED,
     // ring, meter and fader), and dropping mid-sysex tears the frame.
     s_txQueue = xQueueCreate(1024, sizeof(MidiPacket));
