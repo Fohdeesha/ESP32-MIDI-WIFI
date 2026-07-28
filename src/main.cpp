@@ -2,6 +2,7 @@
 
 #include "boot_guard.h"
 #include "config.h"
+#include "midi_bridge.h"
 #include "rtp_midi.h"
 #include "status_led.h"
 #include "usb_midi_host.h"
@@ -62,7 +63,7 @@ void loop() {
         RtpMidi::begin();
     }
     RtpMidi::tick();
-    UsbMidi::tick();
+    MidiBridge::tick();
     WebUi::tick();
     BootGuard::tick();
     factoryResetTick();

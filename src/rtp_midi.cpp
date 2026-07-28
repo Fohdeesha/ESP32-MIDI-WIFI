@@ -16,44 +16,11 @@ namespace {
 bool started = false;
 int s_peerCount = 0;
 
-#ifdef RTP_TEST_NOTES
-// Short arpeggio sent when a peer connects, so the session can be verified
-// end-to-end from the DAW without a USB device attached. Remove once the
-// USB bridge (0.5.0) is in place.
-constexpr uint8_t ARP_NOTES[] = {60, 64, 67, 72};  // C4 E4 G4 C5
-constexpr uint32_t ARP_STEP_MS = 150;
-int arpStep = -1;  // -1 = idle; even = note on, odd = note off
-uint32_t arpLastMs = 0;
-
-void arpeggioTick() {
-    if (arpStep < 0 || s_peerCount == 0) return;
-    uint32_t now = millis();
-    if (now - arpLastMs < ARP_STEP_MS) return;
-    arpLastMs = now;
-
-    int noteIdx = arpStep / 2;
-    if (noteIdx >= (int)sizeof(ARP_NOTES)) {
-        arpStep = -1;
-        return;
-    }
-    if (arpStep % 2 == 0) {
-        MIDI.sendNoteOn(ARP_NOTES[noteIdx], 100, 1);
-    } else {
-        MIDI.sendNoteOff(ARP_NOTES[noteIdx], 0, 1);
-    }
-    arpStep++;
-}
-#endif
-
 void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/, const char* name) {
     s_peerCount++;
     Serial.printf("[rtp] peer connected: \"%s\" (peers: %d)\n",
                   (name && name[0]) ? name : "?", s_peerCount);
     StatusLed::set(LedStatus::SessionActive);
-#ifdef RTP_TEST_NOTES
-    arpStep = 0;
-    arpLastMs = millis();
-#endif
 }
 
 void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/) {
@@ -81,9 +48,6 @@ bool RtpMidi::isStarted() {
 void RtpMidi::tick() {
     if (!started) return;
     MIDI.read();
-#ifdef RTP_TEST_NOTES
-    arpeggioTick();
-#endif
 }
 
 bool RtpMidi::hasPeer() {
@@ -100,4 +64,28 @@ void RtpMidi::sendNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
 
 void RtpMidi::sendNoteOff(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (started && s_peerCount > 0) MIDI.sendNoteOff(note, velocity, channel);
+}
+
+void RtpMidi::sendControlChange(uint8_t channel, uint8_t controller, uint8_t value) {
+    if (started && s_peerCount > 0) MIDI.sendControlChange(controller, value, channel);
+}
+
+void RtpMidi::sendProgramChange(uint8_t channel, uint8_t program) {
+    if (started && s_peerCount > 0) MIDI.sendProgramChange(program, channel);
+}
+
+void RtpMidi::sendAfterTouch(uint8_t channel, uint8_t pressure) {
+    if (started && s_peerCount > 0) MIDI.sendAfterTouch(pressure, channel);
+}
+
+void RtpMidi::sendAfterTouchPoly(uint8_t channel, uint8_t note, uint8_t pressure) {
+    if (started && s_peerCount > 0) MIDI.sendAfterTouch(note, pressure, channel);
+}
+
+void RtpMidi::sendPitchBend(uint8_t channel, int value) {
+    if (started && s_peerCount > 0) MIDI.sendPitchBend(value, channel);
+}
+
+void RtpMidi::sendSysEx(const uint8_t* data, uint16_t length) {
+    if (started && s_peerCount > 0) MIDI.sendSysEx(length, data, true);
 }

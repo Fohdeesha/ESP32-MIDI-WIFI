@@ -6,6 +6,7 @@
 
 #include "boot_guard.h"
 #include "config.h"
+#include "midi_bridge.h"
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
 
@@ -54,6 +55,8 @@ String statusSection() {
     s += "<tr><td>RTP-MIDI peers</td><td>" + String(RtpMidi::peerCount()) + "</td></tr>";
     s += "<tr><td>USB MIDI</td><td>" + htmlEscape(UsbMidi::statusText()) + "</td></tr>";
     s += "<tr><td>USB events</td><td>" + String(UsbMidi::eventCount()) + "</td></tr>";
+    s += "<tr><td>Bridged to RTP</td><td>" + String(MidiBridge::forwardedCount()) +
+         " (cable 1 only)</td></tr>";
     s += "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>";
     s += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " kB</td></tr>";
     s += F("</table>");

@@ -363,16 +363,17 @@ void UsbMidi::begin() {
     Serial.println("[usb] host mode active, waiting for device on OTG port");
 }
 
-void UsbMidi::tick() {
-    if (!s_queue) return;
+bool UsbMidi::readPacket(uint8_t out[4]) {
+    if (!s_queue) return false;
     MidiPacket pkt;
-    while (xQueueReceive(s_queue, &pkt, 0) == pdTRUE) {
-        char* slot = s_ring[s_eventCount % LOG_RING];
-        if (formatPacket(pkt, slot, sizeof(s_ring[0]))) {
-            Serial.printf("[usb] %s\n", slot);
-            s_eventCount++;
-        }
+    if (xQueueReceive(s_queue, &pkt, 0) != pdTRUE) return false;
+    char* slot = s_ring[s_eventCount % LOG_RING];
+    if (formatPacket(pkt, slot, sizeof(s_ring[0]))) {
+        Serial.printf("[usb] %s\n", slot);
+        s_eventCount++;
     }
+    memcpy(out, pkt.b, 4);
+    return true;
 }
 
 bool UsbMidi::deviceConnected() {
