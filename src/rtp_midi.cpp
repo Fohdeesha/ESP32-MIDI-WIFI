@@ -11,7 +11,27 @@
 // Defines global session + MIDI interface objects (AppleMIDI, MIDI).
 // Must appear in exactly one translation unit -- keep it in this .cpp only.
 // The name here is a placeholder; begin() sets the configured name.
-APPLEMIDI_CREATE_INSTANCE(WiFiUDP, MIDI, "ESP32-MIDI", 5004);
+//
+// Custom settings instead of APPLEMIDI_CREATE_INSTANCE: the parse buffer must
+// hold a whole WiFi datagram. The lathoub rtpMIDI parser keeps state ACROSS
+// datagrams (headers-complete flag + command-section countdown over the
+// concatenated byte stream), so with the stock 64-byte buffer any datagram
+// larger than 64 bytes parses straddling reads -- and one lost datagram
+// mid-packet splices the next packet's bytes into the previous command
+// section. A garbage length field read that way makes the parser swallow the
+// slow trickle of session commands (CK1 answers, invite OKs) for minutes:
+// sessions then die with MaxAttempts / NoResponseFromConnectionRequest over
+// and over until reboot -- the exact wedge a busy MIDI host's display load
+// exposes. With an MTU-sized buffer every datagram is parsed whole and the
+// parser state returns to idle at each datagram boundary, so a lost packet
+// costs only its own contents.
+struct EspMidiSettings : public APPLEMIDI_NAMESPACE::DefaultSettings {
+    static const size_t MaxBufferSize = 1536;
+};
+using EspMidiSession = APPLEMIDI_NAMESPACE::AppleMIDISession<WiFiUDP, EspMidiSettings>;
+EspMidiSession AppleMIDI("ESP32-MIDI", 5004);
+MIDI_NAMESPACE::MidiInterface<EspMidiSession, APPLEMIDI_NAMESPACE::AppleMIDISettings> MIDI(
+    AppleMIDI);
 
 namespace {
 bool started = false;
