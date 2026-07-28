@@ -75,6 +75,15 @@ String statusSection() {
         s += htmlEscape(ev);
         s += F("</pre>");
     }
+    {
+        String ev;
+        RtpMidi::appendEventLog(ev, "\n");
+        if (ev.length()) {
+            s += F("<p><small>RTP-MIDI session events:</small></p><pre>");
+            s += htmlEscape(ev);
+            s += F("</pre>");
+        }
+    }
     if (UsbMidi::descriptorDump()[0]) {
         s += F("<details class='nets'><summary>USB descriptors</summary><pre>");
         s += htmlEscape(UsbMidi::descriptorDump());

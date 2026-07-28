@@ -18,6 +18,39 @@ bool started = false;
 int s_peerCount = 0;
 uint32_t s_lastInviteMs = 0;
 
+// Session-event ring for the web UI: connects, disconnects and library
+// exceptions with uptime stamps, so session drops are diagnosable on a
+// headless device (serial is unplugged while the board sits at the P1-M).
+constexpr int EVLOG_SIZE = 24;
+char s_evlog[EVLOG_SIZE][48];
+int s_evlogNext = 0;
+
+void evlog(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char* dst = s_evlog[s_evlogNext];
+    int n = snprintf(dst, sizeof(s_evlog[0]), "%7lus ", millis() / 1000);
+    vsnprintf(dst + n, sizeof(s_evlog[0]) - n, fmt, ap);
+    va_end(ap);
+    s_evlogNext = (s_evlogNext + 1) % EVLOG_SIZE;
+    Serial.printf("[rtp] %s\n", dst);
+}
+
+const char* const EXCEPTION_NAMES[] = {
+    "BufferFull", "Parse", "UnexpectedParse", "TooManyParticipants",
+    "ComputerNotInDirectory", "NotAcceptingAnyone", "UnexpectedInvite",
+    "ParticipantNotFound", "ListenerTimeOut", "MaxAttempts",
+    "NoResponseFromConnectionRequest", "SendPacketsDropped",
+    "ReceivedPacketsDropped", "UdpBeginPacketFailed"};
+
+void onException(const APPLEMIDI_NAMESPACE::ssrc_t&,
+                 const APPLEMIDI_NAMESPACE::Exception& e, const int32_t value) {
+    const char* name = (e < sizeof(EXCEPTION_NAMES) / sizeof(EXCEPTION_NAMES[0]))
+                           ? EXCEPTION_NAMES[e]
+                           : "?";
+    evlog("EX %s (%ld)", name, (long)value);
+}
+
 // Initiator mode (0.8.0): when a peer target is configured and no session
 // is up, invite it. The library retries each invite every 1 s for up to 13
 // attempts before cleaning up, so a fresh sendInvite every 30 s never
@@ -42,14 +75,13 @@ void inviteTick() {
 
 void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/, const char* name) {
     s_peerCount++;
-    Serial.printf("[rtp] peer connected: \"%s\" (peers: %d)\n",
-                  (name && name[0]) ? name : "?", s_peerCount);
+    evlog("connected \"%s\" (peers %d)", (name && name[0]) ? name : "?", s_peerCount);
     StatusLed::set(LedStatus::SessionActive);
 }
 
 void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/) {
     if (s_peerCount > 0) s_peerCount--;
-    Serial.printf("[rtp] peer disconnected (peers: %d)\n", s_peerCount);
+    evlog("disconnected (peers %d)", s_peerCount);
     if (s_peerCount == 0) StatusLed::set(LedStatus::WifiConnected);
 }
 
@@ -72,6 +104,7 @@ void RtpMidi::begin() {
     AppleMIDI.setName(Config::get().sessionName.c_str());
     AppleMIDI.setHandleConnected(onPeerConnected);
     AppleMIDI.setHandleDisconnected(onPeerDisconnected);
+    AppleMIDI.setHandleException(onException);
     MIDI.setHandleNoteOn(onRxNoteOn);
     MIDI.setHandleNoteOff(onRxNoteOff);
     MIDI.setHandleControlChange(onRxControlChange);
@@ -142,4 +175,13 @@ void RtpMidi::sendPitchBend(uint8_t channel, int value) {
 
 void RtpMidi::sendSysEx(const uint8_t* data, uint16_t length) {
     if (started && s_peerCount > 0) MIDI.sendSysEx(length, data, true);
+}
+
+void RtpMidi::appendEventLog(String& out, const char* sep) {
+    for (int i = 0; i < EVLOG_SIZE; i++) {
+        const char* line = s_evlog[(s_evlogNext + i) % EVLOG_SIZE];
+        if (!line[0]) continue;
+        out += line;
+        out += sep;
+    }
 }
