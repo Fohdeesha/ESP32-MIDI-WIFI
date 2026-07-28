@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.5.1**
+**Current version: 1.5.2**
 
 ## How it works
 
@@ -54,7 +54,7 @@ configurable per direction (default: the first port, both ways).
   initiate (and re-invite every 30 s until connected).
 - **Web config UI** (`http://esp32-midi.local/`): status, WiFi and network
   settings, RTP-MIDI session settings, MIDI port selection, password
-  management, factory reset, and a live diagnostics view in collapsible
+  management, reboot, factory reset, and a live diagnostics view in collapsible
   sections (USB state, decoded recent MIDI events in both directions with their
   port numbers, RTP-MIDI session event log, USB descriptor dump).
 - **Static IP or DHCP** (DHCP by default), configurable from the web UI with
@@ -176,8 +176,11 @@ Everything is set from the web UI:
   validated before saving. Note that a wrong-but-valid static address can make
   the device unreachable; recovery is the BOOT-button factory reset below.
 - **Web UI password**: HTTP Basic auth (username `admin`) guarding the page,
-  config changes, OTA uploads, and factory reset. Default `midimidi`;
+  config changes, OTA uploads, reboot, and factory reset. Default `midimidi`;
   changeable or removable.
+
+Reboot (keeps all settings): button on the config page, for a remote
+power-cycle equivalent.
 
 Factory reset (erases all settings): button on the config page, or hold the
 **BOOT button for 10 seconds** while the device is running — the recovery path
@@ -185,6 +188,9 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.5.2 — a **Reboot** button on the config page, next to the firmware update
+  and factory reset controls: restarts the device without touching any
+  settings, for when a remote power-cycle is all that is wanted.
 - 1.5.1 — status page tidy-up: the three diagnostic logs (recent MIDI from the
   device, recent MIDI to the device, RTP-MIDI session events) are now
   collapsible sections that start closed, like the USB descriptor dump, so the

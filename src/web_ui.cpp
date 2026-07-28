@@ -363,6 +363,12 @@ void handleRoot() {
               "<form method='POST' action='/update' enctype='multipart/form-data'>"
               "<input type='file' name='fw' accept='.bin'>"
               "<button type='submit'>Upload &amp; flash</button></form>"
+              "<h2>Reboot</h2>"
+              "<form method='POST' action='/reboot' "
+              "onsubmit=\"return confirm('Reboot the device now?')\">"
+              "<button type='submit'>Reboot</button></form>"
+              "<p><small>Restarts the firmware. Settings are kept; the MIDI session "
+              "drops and re-establishes.</small></p>"
               "<h2>Factory reset</h2>"
               "<form method='POST' action='/reset' "
               "onsubmit=\"return confirm('Erase all settings and reboot?')\">"
@@ -532,6 +538,19 @@ void handleUpdateUpload() {
         Serial.println("[web] firmware upload aborted");
     }
 }
+
+// Settings survive; this is only a power-cycle equivalent. markStable() first,
+// like every other deliberate reboot, so it never counts toward the boot guard's
+// rollback threshold.
+void handleRebootPost() {
+    if (!authOk()) return server.requestAuthentication();
+    Serial.println("[web] reboot requested");
+    server.send(200, "text/html",
+                "<meta http-equiv='refresh' content='10;url=/'>Rebooting...");
+    BootGuard::markStable();
+    delay(300);
+    ESP.restart();
+}
 }  // namespace
 
 void handleResetPost() {
@@ -549,6 +568,7 @@ void WebUi::begin() {
     server.on("/config", HTTP_POST, handleConfigPost);
     server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
     server.on("/reset", HTTP_POST, handleResetPost);
+    server.on("/reboot", HTTP_POST, handleRebootPost);
     server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
     server.begin();
     Serial.println("[web] config UI on http://esp32-midi.local/");
