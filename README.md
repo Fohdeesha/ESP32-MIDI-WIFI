@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.4.0**
+**Current version: 1.5.0**
 
 ## How it works
 
@@ -46,7 +46,9 @@ configurable per direction (default: the first port, both ways).
   what the device declares in that direction.
 - **Bidirectional RTP-MIDI bridge** hardened for sustained high-rate traffic
   (large parse buffer so no datagram straddles reads, deep TX queue with
-  backpressure so device-bound SysEx bursts don't tear).
+  backpressure so device-bound SysEx bursts don't tear) and for low latency:
+  the main loop is kept free of blocking calls, including in the upstream
+  AppleMIDI library, and runs at ~480 Hz under a heavy bidirectional load.
 - **Session listener and initiator**: by default the device accepts incoming
   AppleMIDI invitations; optionally configure a peer IP:port and it will
   initiate (and re-invite every 30 s until connected).
@@ -108,6 +110,12 @@ pio run -t upload        # first flash (via the UART port)
 pio device monitor       # serial console, 115200 baud
 ```
 
+The build runs `tools/patch_applemidi.py` first, which removes a per-SysEx-byte
+`Serial.print` from the AppleMIDI dependency — left-over debug code in its only
+release, and enough to stall the main loop for hundreds of milliseconds under a
+SysEx load (see 1.5.0 below). The script is idempotent and fails the build if
+that code ever changes upstream, so the fix can't silently lapse.
+
 Subsequent updates can go over the air instead:
 
 ```sh
@@ -131,7 +139,11 @@ factory reset) the device opens a WiFi access point:
 
 Everything is set from the web UI:
 
-- **WiFi**: SSID (with a live scan list) and password.
+- **WiFi**: SSID and password. The page lists nearby networks to pick from, but
+  only scans while no MIDI session is connected — scanning takes the radio off
+  its channel for several seconds, which would interrupt a live stream. During
+  a session you can type the SSID, or use the "scan anyway" link and accept a
+  brief dropout.
 - **RTP-MIDI session name** shown to network peers.
 - **Connect to peer**: leave blank to accept incoming session invitations, or
   enter an IP (and port) to have the device initiate the session — useful when
@@ -173,6 +185,25 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.5.0 — **large latency fix.** Under a sustained device-bound SysEx load (a
+  control surface's displays), the main loop was collapsing from ~480 Hz to
+  around 4 Hz, with single iterations as long as 240 ms. Incoming MIDI was then
+  delivered in four clumps a second instead of continuously, ~6% of outgoing
+  RTP packets were lost to the resulting back-to-back bursts, and inbound
+  display writes were dropped wholesale. The cause was in the upstream
+  AppleMIDI library: its SysEx parser prints every SysEx byte to `Serial`, in
+  code that is not behind any debug switch, and Arduino-ESP32 gives
+  `HardwareSerial` no TX buffer — so each byte cost ~434 µs of blocking UART
+  whether or not anything was listening on the port. One 945-byte datagram took
+  206 ms to parse. The library is patched at build time (`tools/`), and the
+  build fails rather than silently reshipping the stall if a future release
+  changes that code. A per-event `Serial` log on the USB → network path was
+  removed for the same reason. Measured after: loop max 49 ms and zero
+  iterations over 100 ms across 1.07 M iterations, no RTP packet loss.
+  Also: browsing the web UI no longer starts a WiFi scan while a MIDI session
+  is connected — a scan takes the radio off-channel for seconds and interrupted
+  the stream. The network list is still scanned during setup, and there's an
+  explicit "scan anyway" link
 - 1.4.0 — the bridged port is now selectable per direction. The network → device
   port defaults to following the device → network one (what a control surface
   needs), and can be set independently for the two cases where that isn't

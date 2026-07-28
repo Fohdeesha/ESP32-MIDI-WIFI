@@ -55,6 +55,9 @@ void setup() {
     UsbMidi::begin(Config::get().usbIface);
 }
 
+// Nothing in here may block. The USB->RTP path's latency is this loop's period,
+// and a host watchdog may allow as little as 2 s of silence -- so a stall here
+// is stuttering control, then a dropped session. Healthy: ~480 Hz, 2.1 ms mean.
 void loop() {
     StatusLed::tick();
     WifiNet::tick();

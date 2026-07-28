@@ -152,11 +152,19 @@ String htmlEscape(const String& in) {
     return out;
 }
 
-// Serves the previous async scan's results and kicks off a fresh scan, so
-// the list is at most one page-load stale. Rendered as clickable chips that
-// fill the SSID input -- a <datalist> gets suppressed by browser password
-// managers on forms that contain password fields.
-String ssidChips() {
+// Serves the previous async scan's results, and kicks off a fresh scan ONLY
+// when that is safe. Rendered as clickable chips that fill the SSID input -- a
+// <datalist> gets suppressed by browser password managers on forms that contain
+// password fields.
+//
+// A scan is not free: the station leaves its home channel and hops the band for
+// seconds, during which MIDI in BOTH directions stalls. Measured 2026-07-28 --
+// merely VIEWING this page mid-session was enough to disturb the stream, and a
+// host that watchdogs the link can drop the session over it. So the scan is
+// started only when no RTP-MIDI peer is connected (setup time -- the only time
+// the list is actually wanted), or when the operator explicitly asks with
+// ?scan=1 and accepts the glitch.
+String ssidChips(bool allowScan) {
     String out;
     int n = WiFi.scanComplete();
     if (n > 0) {
@@ -188,10 +196,18 @@ String ssidChips() {
         out += F(")</summary><table>");
         out += rows;
         out += F("</table></details>");
-    } else if (n == 0) {
+    } else if (n == 0 && allowScan) {
         out = F("<p><small>No networks found yet -- reload to rescan.</small></p>");
-    } else {
+    } else if (allowScan) {
         out = F("<p><small>Scanning for networks... reload in a few seconds.</small></p>");
+    }
+    if (!allowScan) {
+        out += F("<p><small>Network scanning is paused while a MIDI session is "
+                 "active -- a scan takes the radio off-channel for seconds and "
+                 "would interrupt the stream. "
+                 "<a href='/?scan=1'>Scan anyway</a> (expect a brief dropout), or "
+                 "just type the SSID above.</small></p>");
+        return out;
     }
     if (n >= 0) WiFi.scanDelete();
     WiFi.scanNetworks(true);
@@ -275,7 +291,8 @@ void handleRoot() {
               "<input type='text' name='ssid' autocomplete='off' value='");
     page += htmlEscape(c.wifiSsid);
     page += F("'>");
-    page += ssidChips();
+    // Safe to scan when nothing is listening to us, or when explicitly asked.
+    page += ssidChips(!RtpMidi::hasPeer() || server.arg("scan") == "1");
     page += F("<label>WiFi password <small>(leave blank to keep current)</small></label>"
               "<input type='password' name='pass' value=''>"
               "<label>RTP-MIDI session name</label><input type='text' name='name' maxlength='24' value='");

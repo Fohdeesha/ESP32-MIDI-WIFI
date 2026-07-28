@@ -557,8 +557,13 @@ bool UsbMidi::readPacket(uint8_t out[4]) {
     if (xQueueReceive(s_queue, &pkt, 0) != pdTRUE) return false;
     s_cableRx[pkt.b[0] >> 4]++;
     char* slot = s_ring[s_eventCount % LOG_RING];
+    // Deliberately NOT logged to Serial: this is the per-event USB->RTP
+    // forwarding path, and Arduino-ESP32 gives HardwareSerial no TX ring
+    // (_txBufferSize = 0), so every printf blocks at wire rate once the
+    // 128-byte FIFO fills -- ~2 ms per event at 115200. A moving fader emits
+    // >100 events/s, so the log alone cost ~25% of the loop. The web status
+    // page's event ring is the diagnostic, and it is free.
     if (formatPacket(pkt, slot, sizeof(s_ring[0]))) {
-        Serial.printf("[usb] %s\n", slot);
         s_eventCount++;
     }
     memcpy(out, pkt.b, 4);
