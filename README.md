@@ -1,5 +1,7 @@
 # ESP32-MIDI-WIFI
 
+[![build](https://github.com/Fohdeesha/ESP32-MIDI-WIFI/actions/workflows/build.yml/badge.svg)](https://github.com/Fohdeesha/ESP32-MIDI-WIFI/actions/workflows/build.yml)
+
 Firmware for the ESP32-S3 that turns any class-compliant USB MIDI device into a
 wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 (host mode) and its MIDI events are bridged — in both directions — over WiFi
@@ -68,6 +70,24 @@ correctly in both directions. Virtual cable 0 is bridged.
   devkits need a jumper or external 5 V feed for this (e.g. the USB-OTG pad on
   the DevKitC-1).
 - Status LED is the devkit's onboard WS2812 on GPIO 48.
+
+## Pre-built firmware
+
+Every version is built by CI and published on the
+[Releases](https://github.com/Fohdeesha/ESP32-MIDI-WIFI/releases) page, so
+building from source is only necessary if you are changing the firmware. Each
+release carries:
+
+- `ESP32-MIDI-WIFI-<version>.bin` — the application image, for OTA updates.
+- `ESP32-MIDI-WIFI-<version>-merged.bin` — a complete flash image for a blank
+  board:
+
+  ```sh
+  esptool --chip esp32s3 write_flash 0x0 ESP32-MIDI-WIFI-<version>-merged.bin
+  ```
+
+- `bootloader.bin` and `partitions.bin`, if you prefer to flash the pieces
+  separately (offsets 0x0 and 0x8000; the application goes at 0x10000).
 
 ## Building
 

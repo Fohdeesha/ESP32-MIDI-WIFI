@@ -1,0 +1,165 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO and esptool
+        run: pip install --upgrade platformio "esptool==4.8.1"
+
+      - name: Read firmware version
+        id: version
+        run: |
+          VERSION=$(sed -n "s/.*-DFW_VERSION='\"\([^\"]*\)\"'.*/\1/p" platformio.ini | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "Could not find FW_VERSION in platformio.ini" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Firmware version: $VERSION"
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Stage release assets
+        id: assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          BUILD=.pio/build/esp32-s3-devkitc-1
+          mkdir -p dist
+          cp "$BUILD/firmware.bin"    "dist/ESP32-MIDI-WIFI-$VERSION.bin"
+          cp "$BUILD/bootloader.bin"  "dist/bootloader.bin"
+          cp "$BUILD/partitions.bin"  "dist/partitions.bin"
+
+          # Single-file image for flashing a blank board (esptool write_flash 0x0 ...).
+          BOOT_APP0=$(find ~/.platformio/packages -name boot_app0.bin | head -1)
+          if [ -n "$BOOT_APP0" ]; then
+            python -m esptool --chip esp32s3 merge_bin \
+              --flash_mode keep --flash_freq keep --flash_size 16MB \
+              -o "dist/ESP32-MIDI-WIFI-$VERSION-merged.bin" \
+              0x0     "$BUILD/bootloader.bin" \
+              0x8000  "$BUILD/partitions.bin" \
+              0xe000  "$BOOT_APP0" \
+              0x10000 "$BUILD/firmware.bin"
+          else
+            echo "::warning::boot_app0.bin not found; skipping the merged flash image"
+          fi
+          ls -l dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ steps.version.outputs.version }}
+          path: dist/*
+
+      # ---- release, only on main and only when the version is new ----
+
+      - name: Check whether this version is already released
+        id: released
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION is already released; nothing to publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION is new; a release will be published."
+          fi
+
+      - name: Compose release notes
+        if: github.event_name != 'pull_request' && steps.released.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python - <<'PY' > notes.md
+          import os, re, sys
+
+          sys.stdout.reconfigure(encoding="utf-8")
+          version = os.environ["VERSION"]
+          readme = open("README.md", encoding="utf-8").read()
+
+          # Pull this version's bullet out of the README's "Version history" section.
+          section = re.search(r"^## Version history\s*$(.*?)(?=^## |\Z)",
+                              readme, re.M | re.S)
+          entry = ""
+          if section:
+              body = section.group(1)
+              # The bullets read "- 1.2.0 <em dash> summary...", possibly wrapped.
+              pattern = r"^- " + re.escape(version) + " " + chr(8212) + " " + r"(.*?)(?=^- \d|\Z)"
+              m = re.search(pattern, body, re.M | re.S)
+              if m:
+                  # Un-wrap the bullet's continuation lines into a paragraph.
+                  entry = " ".join(line.strip() for line in m.group(1).splitlines()
+                                   if line.strip())
+
+          print("## What's in this build" if entry else "## Release %s" % version)
+          print()
+          if entry:
+              print(entry)
+              print()
+          print("## Flashing")
+          print()
+          print("**Over the air** (device already on your network):")
+          print()
+          print("```sh")
+          print("curl -u admin:<password> -F \"fw=@ESP32-MIDI-WIFI-%s.bin\" \\" % version)
+          print("     http://esp32-midi.local/update")
+          print("```")
+          print()
+          print("**Blank board over USB** (UART port):")
+          print()
+          print("```sh")
+          print("esptool --chip esp32s3 write_flash 0x0 ESP32-MIDI-WIFI-%s-merged.bin" % version)
+          print("```")
+          print()
+          print("| Asset | Use |")
+          print("| --- | --- |")
+          print("| `ESP32-MIDI-WIFI-%s.bin` | application image - OTA upload |" % version)
+          print("| `ESP32-MIDI-WIFI-%s-merged.bin` | full flash image at offset 0x0 - first flash |" % version)
+          print("| `bootloader.bin`, `partitions.bin` | components, if flashing pieces separately |")
+          PY
+          cat notes.md
+
+      - name: Publish release
+        if: github.event_name != 'pull_request' && steps.released.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes-file notes.md \
+            --target "$GITHUB_SHA" \
+            dist/*
