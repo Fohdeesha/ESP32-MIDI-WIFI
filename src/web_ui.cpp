@@ -52,7 +52,12 @@ String statusSection() {
     s += "<tr><td>Firmware</td><td>v" FW_VERSION "</td></tr>";
     s += "<tr><td>IP</td><td>" + WiFi.localIP().toString() + "</td></tr>";
     s += "<tr><td>RSSI</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
-    s += "<tr><td>RTP-MIDI peers</td><td>" + String(RtpMidi::peerCount()) + "</td></tr>";
+    String peers = String(RtpMidi::peerCount());
+    if (Config::get().targetIp.length() && RtpMidi::peerCount() == 0) {
+        peers += " (inviting " + htmlEscape(Config::get().targetIp) + ":" +
+                 String(Config::get().targetPort) + ")";
+    }
+    s += "<tr><td>RTP-MIDI peers</td><td>" + peers + "</td></tr>";
     s += "<tr><td>USB MIDI</td><td>" + htmlEscape(UsbMidi::statusText()) + "</td></tr>";
     s += "<tr><td>USB events</td><td>" + String(UsbMidi::eventCount()) + "</td></tr>";
     s += "<tr><td>USB &rarr; RTP</td><td>" + String(MidiBridge::forwardedCount()) +

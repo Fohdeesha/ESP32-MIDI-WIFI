@@ -16,6 +16,29 @@ APPLEMIDI_CREATE_INSTANCE(WiFiUDP, MIDI, "ESP32-MIDI", 5004);
 namespace {
 bool started = false;
 int s_peerCount = 0;
+uint32_t s_lastInviteMs = 0;
+
+// Initiator mode (0.8.0): when a peer target is configured and no session
+// is up, invite it. The library retries each invite every 1 s for up to 13
+// attempts before cleaning up, so a fresh sendInvite every 30 s never
+// stacks pending participants.
+constexpr uint32_t INVITE_RETRY_MS = 30000;
+
+void inviteTick() {
+    const Config::Values& c = Config::get();
+    if (c.targetIp.length() == 0 || s_peerCount > 0) return;
+    uint32_t now = millis();
+    if (s_lastInviteMs != 0 && now - s_lastInviteMs < INVITE_RETRY_MS) return;
+    s_lastInviteMs = now;
+    IPAddress ip;
+    if (!ip.fromString(c.targetIp.c_str())) {
+        Serial.printf("[rtp] invalid peer IP in config: \"%s\"\n", c.targetIp.c_str());
+        return;
+    }
+    if (AppleMIDI.sendInvite(ip, c.targetPort)) {
+        Serial.printf("[rtp] inviting peer %s:%u\n", c.targetIp.c_str(), c.targetPort);
+    }
+}
 
 void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/, const char* name) {
     s_peerCount++;
@@ -70,6 +93,7 @@ bool RtpMidi::isStarted() {
 void RtpMidi::tick() {
     if (!started) return;
     MIDI.read();
+    inviteTick();
 }
 
 bool RtpMidi::hasPeer() {
