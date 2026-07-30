@@ -112,6 +112,11 @@ String statusSection() {
         UsbMidi::appendRxDiag(d);
         s += "<tr><td>IN pipeline</td><td>" + htmlEscape(d) + "</td></tr>";
     }
+    {
+        String d;
+        UsbMidi::appendTxDiag(d);
+        s += "<tr><td>OUT pipeline</td><td>" + htmlEscape(d) + "</td></tr>";
+    }
     s += "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>";
     s += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " kB</td></tr>";
     s += F("</table>");
@@ -567,6 +572,47 @@ void handleRebootPost() {
     delay(300);
     ESP.restart();
 }
+
+// Deliberately NOT part of the status page: that page is ~14 kB assembled by
+// repeated String concatenation inside the same task that pumps MIDI, so
+// polling it perturbs exactly the timing a throughput measurement is trying to
+// read. This is a few hundred bytes of plain text, cheap enough to sample once
+// a second during a load ramp without becoming part of the experiment.
+void handleDiag() {
+    if (!authOk()) return server.requestAuthentication();
+    String s;
+    s.reserve(768);
+    s += "fw=" FW_VERSION "\nuptime_s=";
+    s += String(millis() / 1000);
+    s += "\nrssi=";
+    s += String(WiFi.RSSI());
+    s += "\npeers=";
+    s += String(RtpMidi::peerCount());
+    s += "\nrtp_to_usb_events=";
+    s += String(MidiBridge::returnedCount());
+    s += "\ntx_packets=";
+    s += String(UsbMidi::txPacketCount());
+    s += "\ntx_dropped=";
+    s += String(UsbMidi::txDropCount());
+    s += "\nusb_to_rtp_events=";
+    s += String(MidiBridge::forwardedCount());
+    s += "\nhealthy=";
+    s += String(UsbMidi::healthy() ? 1 : 0);
+    s += "\nheap=";
+    s += String(ESP.getFreeHeap());
+    s += "\nout=";
+    UsbMidi::appendTxDiag(s);
+    s += "\nin=";
+    UsbMidi::appendRxDiag(s);
+    s += "\n";
+    server.send(200, "text/plain", s);
+}
+
+void handleDiagReset() {
+    if (!authOk()) return server.requestAuthentication();
+    UsbMidi::resetDiag();
+    server.send(200, "text/plain", "ok\n");
+}
 }  // namespace
 
 void handleResetPost() {
@@ -585,6 +631,8 @@ void WebUi::begin() {
     server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
     server.on("/reset", HTTP_POST, handleResetPost);
     server.on("/reboot", HTTP_POST, handleRebootPost);
+    server.on("/diag", HTTP_GET, handleDiag);
+    server.on("/diagreset", HTTP_GET, handleDiagReset);
     server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
     server.begin();
     Serial.println("[web] config UI on http://esp32-midi.local/");

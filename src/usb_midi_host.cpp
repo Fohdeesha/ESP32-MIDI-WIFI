@@ -93,6 +93,30 @@ volatile uint32_t s_rxErrors = 0;       // IN transfers that errored
 volatile uint32_t s_rxRecovered = 0;    // ...of those, resubmitted successfully
 volatile uint32_t s_rxRetired = 0;      // ...of those, permanently lost (depth--)
 
+// --- OUT-pipeline instrumentation ------------------------------------------
+// healthy() has always been able to say "an OUT transfer has sat unACKed for
+// >2 s" -- i.e. WEDGED, after the fact -- but nothing measured the APPROACH to
+// that. The device-bound rate ceiling was therefore set from a single observed
+// wedge with no visibility into how close normal traffic ran to it.
+//
+// A bulk OUT to a device that is keeping up completes in well under a
+// millisecond. When the device's input buffer fills, its controller NAKs and
+// the transfer's submit->complete latency grows -- continuously, long before
+// it reaches the 2 s health threshold. So this latency IS the headroom gauge:
+//   lat  = submit -> complete   (grows as the device stops draining)
+//   qmax = producer-side backlog high-water (1024 = the queue is overflowing)
+// Both are a handful of adds per transfer, so they stay in permanently.
+volatile uint32_t s_txSubmitUs = 0;
+volatile uint32_t s_txXferCount = 0;    // completed OUT transfers
+volatile uint32_t s_txLatMaxUs = 0;     // worst submit->complete
+volatile uint32_t s_txLatSumUs = 0;     // /count = mean (wraps ~71 min of latency)
+volatile uint32_t s_txLatHist[6] = {};  // <1, <2, <5, <20, <100, >=100 ms
+volatile uint32_t s_txQueueMax = 0;     // high-water TX queue depth (cap 1024)
+volatile uint32_t s_txMaxPkts = 0;      // most packets packed into one transfer
+volatile uint32_t s_txErrors = 0;       // OUT transfers that did not COMPLETE
+volatile uint32_t s_txStalls = 0;       // transfers slower than 100 ms
+volatile uint32_t s_txWedges = 0;       // ...of those, slower than the 2 s health limit
+
 // Flags set in the client event callback, acted on in the client task loop
 // (descriptor walking + claiming shouldn't run inside the callback).
 volatile uint8_t s_pendingAddr = 0;
@@ -234,6 +258,8 @@ void serviceTx() {
     if (usb_host_transfer_submit(s_txXfer) == ESP_OK) {
         s_txInFlight = true;
         s_txSubmitMs = millis();
+        s_txSubmitUs = micros();
+        if ((uint32_t)(n / 4) > s_txMaxPkts) s_txMaxPkts = n / 4;
         s_inFlight++;
     }
 }
@@ -242,9 +268,21 @@ void onTxDone(usb_transfer_t* xfer) {
     s_inFlight--;
     s_txInFlight = false;
     s_txSubmitMs = 0;
+    const uint32_t lat = micros() - s_txSubmitUs;
+    s_txXferCount++;
+    s_txLatSumUs += lat;
+    if (lat > s_txLatMaxUs) s_txLatMaxUs = lat;
+    s_txLatHist[lat < 1000 ? 0 : lat < 2000 ? 1 : lat < 5000 ? 2
+                : lat < 20000              ? 3
+                : lat < 100000             ? 4
+                                           : 5]++;
+    if (lat >= 100000) s_txStalls++;
+    if (lat >= 2000000) s_txWedges++;
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_txDone += xfer->actual_num_bytes / 4;
         serviceTx();  // keep draining if more queued up meanwhile
+    } else {
+        s_txErrors++;
     }
 }
 
@@ -665,6 +703,14 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
         s_txDropped++;
         return false;
     }
+    // Producer-side backlog. Rising above a handful means the device is not
+    // draining as fast as the network is filling -- the earliest warning that
+    // the offered rate has passed what this surface can absorb, and it appears
+    // long before the 20 ms backpressure wait starts costing drops.
+    {
+        const uint32_t depth = uxQueueMessagesWaiting(s_txQueue);
+        if (depth > s_txQueueMax) s_txQueueMax = depth;
+    }
     MidiPacket rec;
     memcpy(rec.b, pkt, 4);
     if (formatPacket(rec, s_txRing[s_txFormatted % LOG_RING], sizeof(s_txRing[0]))) {
@@ -765,6 +811,37 @@ void UsbMidi::appendRxDiag(String& out) {
              (unsigned long)s_rxErrors, (unsigned long)s_rxRecovered,
              (unsigned long)s_rxRetired, s_rxActive, NUM_RX_TRANSFERS);
     out += buf;
+}
+
+void UsbMidi::appendTxDiag(String& out) {
+    char buf[320];
+    const uint32_t n = s_txXferCount;
+    snprintf(buf, sizeof(buf),
+             "transfers=%lu maxpkts=%lu | lat_mean=%lu us lat_max=%lu ms | "
+             "lat <1ms:%lu <2:%lu <5:%lu <20:%lu <100:%lu >=100:%lu | "
+             "qmax=%lu/1024 stalls=%lu wedges=%lu err=%lu",
+             (unsigned long)n, (unsigned long)s_txMaxPkts,
+             (unsigned long)(n ? s_txLatSumUs / n : 0),
+             (unsigned long)(s_txLatMaxUs / 1000), (unsigned long)s_txLatHist[0],
+             (unsigned long)s_txLatHist[1], (unsigned long)s_txLatHist[2],
+             (unsigned long)s_txLatHist[3], (unsigned long)s_txLatHist[4],
+             (unsigned long)s_txLatHist[5], (unsigned long)s_txQueueMax,
+             (unsigned long)s_txStalls, (unsigned long)s_txWedges,
+             (unsigned long)s_txErrors);
+    out += buf;
+}
+
+void UsbMidi::resetDiag() {
+    s_rxDwellMaxUs = s_rxResubMaxUs = s_rxGapMaxUs = 0;
+    s_rxXferCount = s_rxFullXfers = s_rxMaxPkts = 0;
+    s_rxErrors = s_rxRecovered = s_rxRetired = 0;
+    for (auto& h : s_rxGapHist) h = 0;
+    s_txXferCount = s_txLatMaxUs = s_txLatSumUs = 0;
+    s_txQueueMax = s_txMaxPkts = 0;
+    s_txErrors = s_txStalls = s_txWedges = 0;
+    for (auto& h : s_txLatHist) h = 0;
+    s_txDropped = 0;
+    s_txDone = 0;
 }
 
 void UsbMidi::appendRecentEvents(String& out, const char* sep) {

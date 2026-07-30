@@ -81,4 +81,15 @@ const char* descriptorDump();
 // nothing" from "the host left the endpoint unpolled" -- the two candidate
 // causes of clumped MIDI IN, which look identical from the network side.
 void appendRxDiag(String& out);
+// One-line OUT-pipeline health, and the device-bound rate headroom gauge.
+// A bulk OUT to a surface that is keeping up completes in well under a
+// millisecond; as its input buffer fills, its controller NAKs and the
+// submit->complete latency grows continuously -- so lat_max and the queue
+// high-water measure how close the offered rate is to what the device can
+// absorb, which healthy()'s after-the-fact 2 s wedge test cannot.
+void appendTxDiag(String& out);
+// Zeroes both pipelines' diagnostic counters (not the lifetime event counts),
+// so a measurement run starts from a clean slate instead of being averaged
+// against everything since boot.
+void resetDiag();
 }  // namespace UsbMidi
