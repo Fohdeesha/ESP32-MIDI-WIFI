@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.5.2**
+**Current version: 1.6.1**
 
 ## How it works
 
@@ -55,9 +55,11 @@ configurable per direction (default: the first port, both ways).
 - **Web config UI** (`http://esp32-midi.local/`): status, WiFi and network
   settings, RTP-MIDI session settings, MIDI port selection, password
   management, reboot, factory reset, and a live diagnostics view in collapsible
-  sections (USB state, USB IN-pipeline statistics, decoded recent MIDI events in
-  both directions with their port numbers, RTP-MIDI session event log, USB
-  descriptor dump).
+  sections (USB state, USB IN- and OUT-pipeline statistics, decoded recent MIDI
+  events in both directions with their port numbers, RTP-MIDI session event log,
+  USB descriptor dump). A plain-text `/diag` endpoint carries the same counters
+  in a few hundred bytes, cheap enough to poll once a second while measuring
+  throughput; `/diagreset` zeroes them for a fresh run.
 - **Static IP or DHCP** (DHCP by default), configurable from the web UI with
   validation.
 - **OTA firmware updates** over HTTP — no serial connection needed once the
@@ -180,8 +182,8 @@ Everything is set from the web UI:
   config changes, OTA uploads, reboot, and factory reset. Default `midimidi`;
   changeable or removable.
 
-Reboot (keeps all settings): button on the config page, for a remote
-power-cycle equivalent.
+Reboot (keeps all settings): button on the config page beside **Save &
+reboot**, for a remote power-cycle equivalent.
 
 Factory reset (erases all settings): button on the config page, or hold the
 **BOOT button for 10 seconds** while the device is running — the recovery path
@@ -189,6 +191,40 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.6.1 — the **Reboot** button moved up next to **Save & reboot**, at the end
+  of the configuration form, rather than sitting in a section of its own
+  further down the page. Both are one click from the settings you have just
+  been editing, and the reboot control is no longer easy to miss between the
+  firmware update and factory reset blocks.
+- 1.6.0 — **the device-bound pipeline is now measured, not just alarmed on.**
+  The health check could already report a wedged device — an outgoing USB
+  transfer left unacknowledged for more than 2 s — but only after the fact, and
+  nothing showed how close ordinary traffic ran to that limit. A bulk transfer
+  to a device that is keeping up completes in well under a millisecond; as the
+  device's input buffer fills, its controller NAKs and the submit-to-completion
+  latency grows continuously, long before anything trips. That latency is the
+  headroom gauge, so the status page gained an **OUT pipeline** row: per-transfer
+  latency mean/max and histogram, the producer-side queue high-water mark,
+  packets packed per transfer, and stall/wedge/error counts. New with it: a
+  plain-text `/diag` endpoint (a few hundred bytes, safe to poll once a second
+  during a measurement, unlike the ~14 kB status page which perturbs the timing
+  it is reporting) and `/diagreset` to zero the counters for a clean run.
+  Measured with this against a live control surface: 6125 USB-MIDI packets per
+  second sustained, 100% delivered, 59 µs mean transfer latency, queue
+  high-water 2 of 1024, zero stalls.
+- 1.5.4 — four fixes from a sustained-load audit. **USB IN pipeline depth
+  raised from 2 to 4**: two is the bare minimum that keeps one transfer pending
+  while the other is serviced, so a single slow service pass left the endpoint
+  unpolled and the device began accumulating; four tolerates a late pass. **The
+  session event log stopped eating itself** — while no peer is listening, the
+  30 s invite retry wrote two ring entries per attempt (a retry exception plus a
+  phantom disconnect for a session that never established), so a day of uptime
+  showed only minutes of history and evicted anything diagnostic; repeats are
+  now summarised and the phantom disconnect is ignored, which also stops it
+  needlessly re-blanking the attached device's displays. **WiFi TX power is set
+  before the connection starts**, so association cannot silently restore the
+  default. **The status page reserves its buffer up front** instead of growing a
+  ~14 kB string by dozens of reallocations inside the same loop that pumps MIDI.
 - 1.5.3 — **the USB IN pipeline no longer decays.** Two USB IN transfers are
   kept in flight so the attached device always has somewhere to put a MIDI
   message. Previously, any transfer that came back with an error status was

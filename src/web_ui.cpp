@@ -37,6 +37,9 @@ input[type=text],input[type=password],input[type=number],select{width:100%;box-s
 /* White on #e0453a is 4.1:1 -- AA only as large text, hence 1.2em/700. */
 button{margin-top:1em;padding:.5em 1.4em;background:#e0453a;border:0;border-radius:4px;color:#fff;font-size:1.2em;font-weight:700;cursor:pointer}
 button:hover{background:#f2564a}button:active{background:#c53a30}
+/* Secondary action sharing a row with a primary one (#ddd on #333 is 9.2:1). */
+button.alt{background:#333;color:#ddd}button.alt:hover{background:#444}button.alt:active{background:#2a2a2a}
+.btnrow{display:flex;gap:.7em;flex-wrap:wrap;align-items:center}
 .warn{color:#fa5}small{color:#888}
 .nets{margin:.5em 0;border:1px solid #333;border-radius:4px;padding:.2em .6em}
 .nets summary{cursor:pointer;color:#8cf;padding:.3em 0}
@@ -379,17 +382,20 @@ void handleRoot() {
     page += c.webPass.length() ? F("set; blank = keep current") : F("not set; blank = stays off");
     page += F(")</small></label><input type='password' name='webpass' maxlength='63' value=''>"
               "<label><input type='checkbox' name='clearpass' value='1'> Remove web UI password</label>"
-              "<button type='submit'>Save &amp; reboot</button></form>"
+              // The Reboot button sits beside Save & reboot but must NOT submit
+              // the config form, so it posts to a separate empty form declared
+              // below and reached by its id (HTML5 form=). That keeps the two
+              // buttons in one row without nesting forms, which is invalid.
+              "<div class='btnrow'><button type='submit'>Save &amp; reboot</button>"
+              "<button type='submit' form='rebootform' class='alt'>Reboot</button></div></form>"
+              "<form id='rebootform' method='POST' action='/reboot' "
+              "onsubmit=\"return confirm('Reboot the device now?')\"></form>"
+              "<p><small>Reboot restarts the firmware without touching any settings; "
+              "the MIDI session drops and re-establishes.</small></p>"
               "<h2>Firmware update</h2>"
               "<form method='POST' action='/update' enctype='multipart/form-data'>"
               "<input type='file' name='fw' accept='.bin'>"
               "<button type='submit'>Upload &amp; flash</button></form>"
-              "<h2>Reboot</h2>"
-              "<form method='POST' action='/reboot' "
-              "onsubmit=\"return confirm('Reboot the device now?')\">"
-              "<button type='submit'>Reboot</button></form>"
-              "<p><small>Restarts the firmware. Settings are kept; the MIDI session "
-              "drops and re-establishes.</small></p>"
               "<h2>Factory reset</h2>"
               "<form method='POST' action='/reset' "
               "onsubmit=\"return confirm('Erase all settings and reboot?')\">"
