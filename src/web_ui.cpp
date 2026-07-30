@@ -298,7 +298,18 @@ String usbCableOptions(uint8_t sel, bool output) {
 void handleRoot() {
     if (!authOk()) return server.requestAuthentication();
     const Config::Values& c = Config::get();
-    String page = FPSTR(PAGE_HEAD);
+    String page;
+    // Reserve the whole page up front (1.5.4, bridge audit F-12). This handler
+    // runs SYNCHRONOUSLY inside loop() -- the same loop that pumps USB->RTP MIDI,
+    // where main.cpp's comment rightly says nothing in here may block -- and it
+    // builds a ~14 kB page by dozens of String += appends. Every append that
+    // outgrows the buffer reallocs and copies the whole page so far, so an
+    // unreserved build is quadratic heap churn (and fragments the heap) while the
+    // MIDI pump waits. One reservation removes essentially all of it. The
+    // residual stall is the TCP send, which is bounded and only paid when
+    // somebody actually loads the page -- so do not add an auto-refresh here.
+    page.reserve(16384);
+    page += FPSTR(PAGE_HEAD);
     page += statusSection();
     page += F("<h2>Configuration</h2><form method='POST' action='/config' autocomplete='off'>"
               "<label>WiFi SSID <small>(type, or pick from available networks below)</small></label>"

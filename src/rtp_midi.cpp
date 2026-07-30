@@ -65,11 +65,32 @@ const char* const EXCEPTION_NAMES[] = {
     "NoResponseFromConnectionRequest", "SendPacketsDropped",
     "ReceivedPacketsDropped", "UdpBeginPacketFailed"};
 
+// Repeat suppression for the event ring (1.5.4). "No bridge is listening yet"
+// is this device's EXPECTED idle state, not an exception worth a ring slot: the
+// 30 s invite retry wrote TWO entries per attempt (this, plus a phantom
+// disconnect), so the 24-entry ring held only ~6 minutes and evicted anything
+// genuinely diagnostic -- a real session drop, a USB error -- within minutes of
+// it happening. Measured 2026-07-29: 25.7 h of uptime showed four minutes of
+// history. Log the first of a run, then one summary per EX_SUMMARY_EVERY.
+constexpr uint32_t EX_SUMMARY_EVERY = 20;  // ~10 min at the 30 s retry cadence
+int s_lastExCode = -1;
+uint32_t s_exRepeat = 0;
+
 void onException(const APPLEMIDI_NAMESPACE::ssrc_t&,
                  const APPLEMIDI_NAMESPACE::Exception& e, const int32_t value) {
     const char* name = (e < sizeof(EXCEPTION_NAMES) / sizeof(EXCEPTION_NAMES[0]))
                            ? EXCEPTION_NAMES[e]
                            : "?";
+    if (static_cast<int>(e) == s_lastExCode) {
+        if (++s_exRepeat % EX_SUMMARY_EVERY == 0)
+            evlog("EX %s x%lu (still retrying)", name,
+                  (unsigned long)s_exRepeat);
+        return;
+    }
+    if (s_exRepeat > 0)
+        evlog("EX (previous repeated x%lu)", (unsigned long)s_exRepeat);
+    s_lastExCode = static_cast<int>(e);
+    s_exRepeat = 0;
     evlog("EX %s (%ld)", name, (long)value);
 }
 
@@ -102,7 +123,13 @@ void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/, const char* na
 }
 
 void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/) {
-    if (s_peerCount > 0) s_peerCount--;
+    // A failed INVITE also lands here when the library cleans up the participant
+    // it never established, with the count already 0 (1.5.4). That is not a
+    // disconnect: logging it filled the ring every 30 s, and re-blanking the
+    // surface each time sent ~110 pointless USB messages. A session that really
+    // ended always has a peer to lose first.
+    if (s_peerCount == 0) return;
+    s_peerCount--;
     evlog("disconnected (peers %d)", s_peerCount);
     if (s_peerCount == 0) {
         StatusLed::set(LedStatus::WifiConnected);

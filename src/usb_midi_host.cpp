@@ -20,7 +20,13 @@ constexpr uint8_t USB_SUBCLASS_MIDI_STREAMING = 0x03;
 constexpr uint8_t USB_DESC_CS_ENDPOINT = 0x25;
 constexpr uint8_t MS_GENERAL = 0x01;
 
-constexpr int NUM_RX_TRANSFERS = 2;  // keep one IN transfer always pending
+// Four, not two (1.5.4, bridge audit F-11). Two is the bare minimum that keeps
+// one IN transfer pending while the other is serviced, so a single slow service
+// pass leaves the endpoint unpolled and the device starts accumulating -- the
+// exact condition whose signature (clumps of packets after ~92 ms of silence)
+// this file's instrumentation was added to detect. Four costs a few hundred
+// bytes of RAM and tolerates a late pass without ever going unpolled.
+constexpr int NUM_RX_TRANSFERS = 4;
 // More MIDIStreaming interfaces than any real device presents (a multi-port
 // interface uses cables, not extra interfaces); alt settings count separately.
 constexpr int MAX_MIDI_IFACES = 8;

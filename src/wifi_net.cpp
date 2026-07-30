@@ -117,10 +117,13 @@ void WifiNet::begin(const Config::Values& cfg, const char* hostname) {
     WiFi.setAutoReconnect(true);
     WiFi.onEvent(onWifiEvent);
     staticApplied = applyStaticIp(cfg);  // must precede WiFi.begin()
-    WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
     // Full 20 dBm TX glitches the CH340 USB link on this board (RFI/current
-    // spike with the external antenna attached); 11 dBm is plenty.
+    // spike with the external antenna attached); 11 dBm is plenty -- measured
+    // RSSI at the installed position is -39 dBm, so there is ample margin.
+    // Set BEFORE begin() (1.5.4): some IDF versions re-apply the default power
+    // during association, which would silently undo a post-begin() call.
     WiFi.setTxPower(WIFI_POWER_11dBm);
+    WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
     Serial.printf("[net] connecting to \"%s\"...\n", cfg.wifiSsid.c_str());
 }
 
