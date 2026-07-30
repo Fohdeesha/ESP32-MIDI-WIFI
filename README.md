@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.6.2**
+**Current version: 1.6.3**
 
 ![The web UI: status and diagnostics above the configuration form](docs/status-page.png)
 
@@ -193,6 +193,19 @@ Factory reset (erases all settings): button on the config page, or hold the
 for a forgotten password or bad network config on a headless device.
 
 ## Version history
+
+- 1.6.3 — **the bridge no longer rewrites null-velocity Note On as Note Off.**
+  The MIDI library normalises an incoming Note On with velocity 0 into a Note
+  Off by default — reasonable for a synth, wrong for a bridge, whose job is to
+  pass through what it is given. It bit a real control surface: that surface
+  drives its LED and touchscreen-cell state with Note On velocity 127 (on) /
+  velocity 0 (off) — the form its own vendor scripts send, and the form it emits
+  itself for a button release — and it ignores a true Note Off (0x80) for that
+  state. So every host "lamp on" landed while every "lamp off" was discarded,
+  leaving lamps and cells latched on until the surface was power-cycled, with
+  the host sending correct bytes the whole time (confirmed by packet capture)
+  and the device-bound event log showing this firmware converting them. Genuine
+  Note Off messages are unaffected.
 
 - 1.6.2 — diagnostics tidy-up. Resetting the diagnostic counters no longer
   rewinds the status page's running totals: "packets delivered" and "dropped"

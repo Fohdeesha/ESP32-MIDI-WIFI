@@ -32,8 +32,32 @@ struct EspMidiSettings : public APPLEMIDI_NAMESPACE::DefaultSettings {
 };
 using EspMidiSession = APPLEMIDI_NAMESPACE::AppleMIDISession<WiFiUDP, EspMidiSettings>;
 EspMidiSession AppleMIDI("ESP32-MIDI", 5004);
-MIDI_NAMESPACE::MidiInterface<EspMidiSession, APPLEMIDI_NAMESPACE::AppleMIDISettings> MIDI(
-    AppleMIDI);
+
+// A bridge must be byte-transparent: what arrives on one side has to leave on
+// the other unchanged. The MIDI library's DefaultSettings (which AppleMIDI's
+// own settings inherit) sets HandleNullVelocityNoteOnAsNoteOff = true, which
+// rewrites an incoming Note On with velocity 0 into a Note Off -- a convenience
+// for a synth, and wrong for a bridge, because the two are NOT interchangeable
+// to every device even though the MIDI spec treats them as equivalent note
+// releases.
+//
+// Measured 2026-07-30 on the Icon P1-M: its LED and touchscreen-cell state is
+// driven by Note On velocity 127 (on) / velocity 0 (off) -- the form Icon's own
+// DAW scripts send, and the form the surface itself emits for a button release.
+// A real Note Off (0x80) is silently IGNORED for that state. So with the
+// rewrite in place every host "lamp on" landed and every "lamp off" was dropped
+// on the floor: cells and LEDs latched on and could only be cleared by power-
+// cycling the surface. The host was sending the correct bytes all along (packet
+// capture confirmed 90 4A 00 on the wire) -- this bridge was rewriting them to
+// 80 4A 00, and the device-bound event ring showed exactly that ("note off 74").
+//
+// Turning it off makes rtpNoteOn() fire for a null-velocity Note On, which
+// emits USB CIN 0x9 / status 0x90 verbatim. Genuine Note Off messages are
+// unaffected -- they still arrive as NoteOff and still go out as 0x80.
+struct EspMidiInterfaceSettings : public APPLEMIDI_NAMESPACE::AppleMIDISettings {
+    static const bool HandleNullVelocityNoteOnAsNoteOff = false;
+};
+MIDI_NAMESPACE::MidiInterface<EspMidiSession, EspMidiInterfaceSettings> MIDI(AppleMIDI);
 
 namespace {
 bool started = false;
