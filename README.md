@@ -10,6 +10,8 @@ using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 
 **Current version: 1.6.2**
 
+![The web UI: status and diagnostics above the configuration form](docs/status-page.png)
+
 ## How it works
 
 ```
