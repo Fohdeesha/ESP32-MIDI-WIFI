@@ -55,8 +55,9 @@ configurable per direction (default: the first port, both ways).
 - **Web config UI** (`http://esp32-midi.local/`): status, WiFi and network
   settings, RTP-MIDI session settings, MIDI port selection, password
   management, reboot, factory reset, and a live diagnostics view in collapsible
-  sections (USB state, decoded recent MIDI events in both directions with their
-  port numbers, RTP-MIDI session event log, USB descriptor dump).
+  sections (USB state, USB IN-pipeline statistics, decoded recent MIDI events in
+  both directions with their port numbers, RTP-MIDI session event log, USB
+  descriptor dump).
 - **Static IP or DHCP** (DHCP by default), configurable from the web UI with
   validation.
 - **OTA firmware updates** over HTTP — no serial connection needed once the
@@ -188,6 +189,22 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.5.3 — **the USB IN pipeline no longer decays.** Two USB IN transfers are
+  kept in flight so the attached device always has somewhere to put a MIDI
+  message. Previously, any transfer that came back with an error status was
+  retired instead of resubmitted, so a single transient stall shrank the
+  pipeline permanently — 2 in flight, then 1, then 0 — and only a replug or a
+  reboot restored it. The symptom was incoming MIDI arriving in bunches (a
+  device that accumulates messages while nothing is polling it) and eventually
+  a device that appeared deaf while still enumerated. A transfer whose device
+  is still present is now resubmitted, and only a genuinely disconnected device
+  (or a resubmit that also fails) retires it. The status page gained an **IN
+  pipeline** row to make this visible: completed transfers, how many came back
+  with a full buffer, the worst submit-to-completion and completion-to-resubmit
+  times, a completion-interval histogram, error/recovered/retired counts, and
+  the current pipeline depth. That row separates "the device sent nothing" from
+  "the host left the endpoint unpolled" — indistinguishable from the network
+  side, and the reason the decay went unnoticed.
 - 1.5.2 — a **Reboot** button on the config page, next to the firmware update
   and factory reset controls: restarts the device without touching any
   settings, for when a remote power-cycle is all that is wanted.

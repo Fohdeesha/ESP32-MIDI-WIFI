@@ -64,6 +64,29 @@ volatile int s_rxActive = 0;
 // means the device's USB controller has stopped servicing us.
 volatile uint32_t s_txSubmitMs = 0;
 
+// --- IN-pipeline instrumentation -------------------------------------------
+// Measured on a live P1-M: fader messages reach the host in clumps of up to 34
+// packets carrying >5 deg of fader travel yet arriving 0.05 ms apart, with ~92
+// ms of silence before each clump -- the device is accumulating while nothing
+// polls it. These counters separate the two candidate causes:
+//   dwell = submit -> complete      (transfer WAS pending; device sent nothing)
+//   resub = complete -> next submit (we left the endpoint unpolled)
+// A long dwell means the device genuinely produced nothing; a long resub means
+// the host starved it. A few adds per transfer, so it stays in permanently --
+// it is the only way to tell those apart from outside the device.
+volatile uint32_t s_rxSubmitUs[NUM_RX_TRANSFERS] = {};
+volatile uint32_t s_rxLastDoneUs = 0;
+volatile uint32_t s_rxDwellMaxUs = 0;
+volatile uint32_t s_rxResubMaxUs = 0;
+volatile uint32_t s_rxGapMaxUs = 0;     // completion -> completion
+volatile uint32_t s_rxXferCount = 0;    // completed IN transfers
+volatile uint32_t s_rxFullXfers = 0;    // transfers that returned a FULL buffer
+volatile uint32_t s_rxMaxPkts = 0;      // most packets ever in one transfer
+volatile uint32_t s_rxGapHist[6] = {};  // <1, <2, <5, <10, <50, >=50 ms
+volatile uint32_t s_rxErrors = 0;       // IN transfers that errored
+volatile uint32_t s_rxRecovered = 0;    // ...of those, resubmitted successfully
+volatile uint32_t s_rxRetired = 0;      // ...of those, permanently lost (depth--)
+
 // Flags set in the client event callback, acted on in the client task loop
 // (descriptor walking + claiming shouldn't run inside the callback).
 volatile uint8_t s_pendingAddr = 0;
@@ -119,9 +142,38 @@ void utf16ToAscii(const usb_str_desc_t* sd, char* out, size_t outLen) {
     out[n] = '\0';
 }
 
+// Index of an RX transfer in s_xfers, or -1. Only used by the instrumentation.
+int rxSlot(const usb_transfer_t* xfer) {
+    for (int i = 0; i < NUM_RX_TRANSFERS; i++)
+        if (s_xfers[i] == xfer) return i;
+    return -1;
+}
+
 void onTransferDone(usb_transfer_t* xfer) {
     s_inFlight--;
+    const uint32_t now_us = micros();
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED && s_connected) {
+        const int slot = rxSlot(xfer);
+        // dwell: how long this transfer sat pending before the device filled it
+        if (slot >= 0 && s_rxSubmitUs[slot]) {
+            const uint32_t dwell = now_us - s_rxSubmitUs[slot];
+            if (dwell > s_rxDwellMaxUs) s_rxDwellMaxUs = dwell;
+        }
+        // gap: completion-to-completion, the interval the wire actually shows
+        if (s_rxLastDoneUs) {
+            const uint32_t gap = now_us - s_rxLastDoneUs;
+            if (gap > s_rxGapMaxUs) s_rxGapMaxUs = gap;
+            const uint32_t ms = gap / 1000;
+            s_rxGapHist[ms < 1 ? 0 : ms < 2 ? 1 : ms < 5 ? 2
+                                 : ms < 10 ? 3 : ms < 50 ? 4 : 5]++;
+        }
+        s_rxLastDoneUs = now_us;
+        s_rxXferCount++;
+        const uint32_t pkts = (uint32_t)xfer->actual_num_bytes / 4;
+        if (pkts > s_rxMaxPkts) s_rxMaxPkts = pkts;
+        // A FULL buffer means the device had at least this much already queued
+        // -- the signature of it accumulating between polls.
+        if (xfer->actual_num_bytes >= xfer->data_buffer_size) s_rxFullXfers++;
         for (int i = 0; i + 3 < xfer->actual_num_bytes; i += 4) {
             const uint8_t* p = &xfer->data_buffer[i];
             if ((p[0] & 0x0F) == 0) continue;  // CIN 0 = reserved/padding
@@ -130,14 +182,35 @@ void onTransferDone(usb_transfer_t* xfer) {
             xQueueSend(s_queue, &pkt, 0);  // full queue: drop, never block
         }
         if (usb_host_transfer_submit(xfer) == ESP_OK) {
+            const uint32_t sub_us = micros();
+            // resub: how long the endpoint went unpolled by THIS slot
+            const uint32_t resub = sub_us - now_us;
+            if (resub > s_rxResubMaxUs) s_rxResubMaxUs = resub;
+            if (slot >= 0) s_rxSubmitUs[slot] = sub_us;
             s_inFlight++;
             return;
         }
     }
-    // Any error status (NO_DEVICE on unplug, stall, ...) or a failed
-    // resubmit: leave it idle -- cleanup or the next device claim will
-    // resubmit -- but COUNT it out of the active RX set so healthy() can see
-    // a deaf-but-attached pipeline (pre-1.2.0 this state was silent forever).
+    // Error status or a failed resubmit. Pre-1.5.3 this ALWAYS retired the
+    // transfer ("cleanup or the next device claim will resubmit"), so a single
+    // transient stall permanently shrank the IN pipeline 2 -> 1 -> 0 and it
+    // could only recover by replug or reboot -- a slow one-way decay into a
+    // device that is polled less and less often, which is what accumulating
+    // MIDI IN (and eventually a deaf device) looks like from outside.
+    // A live device gets its transfer resubmitted instead; only a genuinely
+    // gone device, or a resubmit that also fails, retires the slot.
+    s_rxErrors++;
+    if (s_connected && xfer->status != USB_TRANSFER_STATUS_NO_DEVICE &&
+        usb_host_transfer_submit(xfer) == ESP_OK) {
+        const int slot = rxSlot(xfer);
+        if (slot >= 0) s_rxSubmitUs[slot] = micros();
+        s_rxRecovered++;
+        s_inFlight++;
+        return;
+    }
+    // COUNT it out of the active RX set so healthy() can see a deaf-but-
+    // attached pipeline (pre-1.2.0 this state was silent forever).
+    s_rxRetired++;
     if (s_rxActive > 0) s_rxActive--;
 }
 
@@ -366,8 +439,14 @@ void attachDevice(uint8_t addr) {
              s_productName, s_ifaceNum, s_epIn ? "" : " (device-bound only)",
              s_ifaceFallback ? " -- configured interface absent" : "");
     s_rxActive = 0;
+    // Instrumentation is per-attach, like s_cableRx.
+    s_rxLastDoneUs = 0; s_rxDwellMaxUs = 0; s_rxResubMaxUs = 0; s_rxGapMaxUs = 0;
+    s_rxXferCount = 0; s_rxFullXfers = 0; s_rxMaxPkts = 0;
+    s_rxErrors = 0; s_rxRecovered = 0; s_rxRetired = 0;
+    for (auto& h : s_rxGapHist) h = 0;
     for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
         if (s_xfers[i] && usb_host_transfer_submit(s_xfers[i]) == ESP_OK) {
+            s_rxSubmitUs[i] = micros();
             s_inFlight++;
             s_rxActive++;
         }
@@ -659,6 +738,27 @@ uint32_t UsbMidi::eventCount() {
 
 const char* UsbMidi::descriptorDump() {
     return s_descDump;
+}
+
+void UsbMidi::appendRxDiag(String& out) {
+    char buf[300];
+    snprintf(buf, sizeof(buf),
+             "transfers=%lu full=%lu (%lu%%) maxpkts=%lu | dwell_max=%lu ms "
+             "resub_max=%lu us gap_max=%lu ms | gaps <1ms:%lu <2:%lu <5:%lu "
+             "<10:%lu <50:%lu >=50:%lu | err=%lu recovered=%lu retired=%lu "
+             "| depth %d/%d",
+             (unsigned long)s_rxXferCount, (unsigned long)s_rxFullXfers,
+             (unsigned long)(s_rxXferCount ? s_rxFullXfers * 100 / s_rxXferCount : 0),
+             (unsigned long)s_rxMaxPkts,
+             (unsigned long)(s_rxDwellMaxUs / 1000),
+             (unsigned long)s_rxResubMaxUs,
+             (unsigned long)(s_rxGapMaxUs / 1000),
+             (unsigned long)s_rxGapHist[0], (unsigned long)s_rxGapHist[1],
+             (unsigned long)s_rxGapHist[2], (unsigned long)s_rxGapHist[3],
+             (unsigned long)s_rxGapHist[4], (unsigned long)s_rxGapHist[5],
+             (unsigned long)s_rxErrors, (unsigned long)s_rxRecovered,
+             (unsigned long)s_rxRetired, s_rxActive, NUM_RX_TRANSFERS);
+    out += buf;
 }
 
 void UsbMidi::appendRecentEvents(String& out, const char* sep) {

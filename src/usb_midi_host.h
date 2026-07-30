@@ -74,4 +74,11 @@ void appendRecentTxEvents(String& out, const char* sep);
 uint32_t txFormattedCount();
 // Parsed + raw config descriptor of the last attached device ("" if none).
 const char* descriptorDump();
+// One-line IN-pipeline health: completed transfers, how many came back with a
+// FULL buffer (the device had data queued, i.e. it was accumulating between
+// polls), the worst submit->complete dwell, the worst complete->resubmit gap,
+// and the completion-interval histogram. Distinguishes "the device sent
+// nothing" from "the host left the endpoint unpolled" -- the two candidate
+// causes of clumped MIDI IN, which look identical from the network side.
+void appendRxDiag(String& out);
 }  // namespace UsbMidi
