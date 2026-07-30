@@ -596,9 +596,10 @@ void handleDiag() {
     s += String(RtpMidi::peerCount());
     s += "\nrtp_to_usb_events=";
     s += String(MidiBridge::returnedCount());
-    s += "\ntx_packets=";
+    // Lifetime totals; the per-window equivalents ride in the out= line.
+    s += "\ntx_packets_total=";
     s += String(UsbMidi::txPacketCount());
-    s += "\ntx_dropped=";
+    s += "\ntx_dropped_total=";
     s += String(UsbMidi::txDropCount());
     s += "\nusb_to_rtp_events=";
     s += String(MidiBridge::forwardedCount());
@@ -614,6 +615,9 @@ void handleDiag() {
     server.send(200, "text/plain", s);
 }
 
+// POST, not GET: this mutates state, and a GET that does so is one browser
+// prefetch or link-scanner away from zeroing a measurement mid-run. Auth makes
+// that unlikely rather than impossible, and the correct method costs nothing.
 void handleDiagReset() {
     if (!authOk()) return server.requestAuthentication();
     UsbMidi::resetDiag();
@@ -638,7 +642,7 @@ void WebUi::begin() {
     server.on("/reset", HTTP_POST, handleResetPost);
     server.on("/reboot", HTTP_POST, handleRebootPost);
     server.on("/diag", HTTP_GET, handleDiag);
-    server.on("/diagreset", HTTP_GET, handleDiagReset);
+    server.on("/diagreset", HTTP_POST, handleDiagReset);
     server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
     server.begin();
     Serial.println("[web] config UI on http://esp32-midi.local/");

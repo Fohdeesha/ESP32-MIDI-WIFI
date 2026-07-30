@@ -88,8 +88,11 @@ void appendRxDiag(String& out);
 // high-water measure how close the offered rate is to what the device can
 // absorb, which healthy()'s after-the-fact 2 s wedge test cannot.
 void appendTxDiag(String& out);
-// Zeroes both pipelines' diagnostic counters (not the lifetime event counts),
-// so a measurement run starts from a clean slate instead of being averaged
-// against everything since boot.
+// Zeroes both pipelines' diagnostic counters, so a measurement run describes
+// itself instead of being averaged against everything since boot. The running
+// totals the status page presents -- packets delivered, packets dropped, and
+// the event counts -- are deliberately left alone: they sit next to counters
+// this cannot reach, so rewinding them would make that row contradict itself.
+// The diagnostic lines carry their own windowed pkts/drops for measurement.
 void resetDiag();
 }  // namespace UsbMidi

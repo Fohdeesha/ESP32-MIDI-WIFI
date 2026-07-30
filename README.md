@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.6.1**
+**Current version: 1.6.2**
 
 ## How it works
 
@@ -59,7 +59,8 @@ configurable per direction (default: the first port, both ways).
   events in both directions with their port numbers, RTP-MIDI session event log,
   USB descriptor dump). A plain-text `/diag` endpoint carries the same counters
   in a few hundred bytes, cheap enough to poll once a second while measuring
-  throughput; `/diagreset` zeroes them for a fresh run.
+  throughput; `POST /diagreset` zeroes the diagnostic counters for a fresh run,
+  leaving the running totals alone.
 - **Static IP or DHCP** (DHCP by default), configurable from the web UI with
   validation.
 - **OTA firmware updates** over HTTP — no serial connection needed once the
@@ -191,6 +192,15 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.6.2 — diagnostics tidy-up. Resetting the diagnostic counters no longer
+  rewinds the status page's running totals: "packets delivered" and "dropped"
+  sit beside an event count the reset never touched, so zeroing one side of that
+  row left it reading as a contradiction. The reset now clears only the
+  measurement counters, and the IN/OUT pipeline lines carry their own
+  per-measurement packet and drop counts so a run still describes itself. The
+  reset endpoint is also **`POST /diagreset`** rather than a GET — it changes
+  state, and a GET that does so can be tripped by a browser prefetch or a link
+  scanner in the middle of a measurement.
 - 1.6.1 — the **Reboot** button moved up next to **Save & reboot**, at the end
   of the configuration form, rather than sitting in a section of its own
   further down the page. Both are one click from the settings you have just

@@ -106,6 +106,11 @@ volatile uint32_t s_rxRetired = 0;      // ...of those, permanently lost (depth-
 //   lat  = submit -> complete   (grows as the device stops draining)
 //   qmax = producer-side backlog high-water (1024 = the queue is overflowing)
 // Both are a handful of adds per transfer, so they stay in permanently.
+//
+// These are all WINDOW counters: resetDiag() zeroes them so a measurement run
+// describes itself rather than everything since boot. The lifetime totals the
+// status page shows (s_txDone / s_txDropped, and the event counts) are
+// deliberately NOT part of that -- see resetDiag().
 volatile uint32_t s_txSubmitUs = 0;
 volatile uint32_t s_txXferCount = 0;    // completed OUT transfers
 volatile uint32_t s_txLatMaxUs = 0;     // worst submit->complete
@@ -116,6 +121,13 @@ volatile uint32_t s_txMaxPkts = 0;      // most packets packed into one transfer
 volatile uint32_t s_txErrors = 0;       // OUT transfers that did not COMPLETE
 volatile uint32_t s_txStalls = 0;       // transfers slower than 100 ms
 volatile uint32_t s_txWedges = 0;       // ...of those, slower than the 2 s health limit
+// Packets delivered / dropped IN THIS WINDOW. Separate from the lifetime
+// s_txDone / s_txDropped precisely so a diagnostic reset cannot rewind the
+// figures the status page presents as running totals: those sit beside an
+// event count that is not reset, and rewinding one of a pair makes the row
+// read as a contradiction.
+volatile uint32_t s_txPktsWindow = 0;
+volatile uint32_t s_txDropWindow = 0;
 
 // Flags set in the client event callback, acted on in the client task loop
 // (descriptor walking + claiming shouldn't run inside the callback).
@@ -279,7 +291,9 @@ void onTxDone(usb_transfer_t* xfer) {
     if (lat >= 100000) s_txStalls++;
     if (lat >= 2000000) s_txWedges++;
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
-        s_txDone += xfer->actual_num_bytes / 4;
+        const uint32_t n = xfer->actual_num_bytes / 4;
+        s_txDone += n;
+        s_txPktsWindow += n;
         serviceTx();  // keep draining if more queued up meanwhile
     } else {
         s_txErrors++;
@@ -701,6 +715,7 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
     // 20 ms is enough to ride out any burst the RTP side can produce.
     if (xQueueSend(s_txQueue, pkt, pdMS_TO_TICKS(20)) != pdTRUE) {
         s_txDropped++;
+        s_txDropWindow++;
         return false;
     }
     // Producer-side backlog. Rising above a handful means the device is not
@@ -817,10 +832,11 @@ void UsbMidi::appendTxDiag(String& out) {
     char buf[320];
     const uint32_t n = s_txXferCount;
     snprintf(buf, sizeof(buf),
-             "transfers=%lu maxpkts=%lu | lat_mean=%lu us lat_max=%lu ms | "
-             "lat <1ms:%lu <2:%lu <5:%lu <20:%lu <100:%lu >=100:%lu | "
-             "qmax=%lu/1024 stalls=%lu wedges=%lu err=%lu",
-             (unsigned long)n, (unsigned long)s_txMaxPkts,
+             "transfers=%lu pkts=%lu drops=%lu maxpkts=%lu | lat_mean=%lu us "
+             "lat_max=%lu ms | lat <1ms:%lu <2:%lu <5:%lu <20:%lu <100:%lu "
+             ">=100:%lu | qmax=%lu/1024 stalls=%lu wedges=%lu err=%lu",
+             (unsigned long)n, (unsigned long)s_txPktsWindow,
+             (unsigned long)s_txDropWindow, (unsigned long)s_txMaxPkts,
              (unsigned long)(n ? s_txLatSumUs / n : 0),
              (unsigned long)(s_txLatMaxUs / 1000), (unsigned long)s_txLatHist[0],
              (unsigned long)s_txLatHist[1], (unsigned long)s_txLatHist[2],
@@ -840,8 +856,13 @@ void UsbMidi::resetDiag() {
     s_txQueueMax = s_txMaxPkts = 0;
     s_txErrors = s_txStalls = s_txWedges = 0;
     for (auto& h : s_txLatHist) h = 0;
-    s_txDropped = 0;
-    s_txDone = 0;
+    s_txPktsWindow = s_txDropWindow = 0;
+    // NOT reset, deliberately: s_txDone / s_txDropped and the event counts are
+    // the running totals the status page presents. Zeroing them here (as this
+    // did until 1.6.2) silently rewound "packets delivered" and "dropped" while
+    // the event count beside them kept counting, so one diagnostic reset left
+    // that row self-contradictory. The window equivalents above serve the
+    // measurement need without touching what the page reports as lifetime.
 }
 
 void UsbMidi::appendRecentEvents(String& out, const char* sep) {
