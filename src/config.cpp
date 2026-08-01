@@ -32,6 +32,8 @@ void Config::load() {
     if (values.usbCableOut > 15 && values.usbCableOut != CABLE_SAME) {
         values.usbCableOut = CABLE_SAME;
     }
+    values.txPower = prefs.getUChar("txp", TX_POWER_DEFAULT);
+    if (!txPowerValid(values.txPower)) values.txPower = TX_POWER_DEFAULT;
     prefs.end();
 }
 
@@ -50,6 +52,7 @@ bool Config::save(const Values& v) {
     prefs.putUChar("uif", v.usbIface);
     prefs.putUChar("ucab", v.usbCable);
     prefs.putUChar("ucabo", v.usbCableOut);
+    prefs.putUChar("txp", v.txPower);
     prefs.end();
     values = v;
     return true;

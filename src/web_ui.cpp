@@ -95,7 +95,17 @@ String statusSection() {
     s += "<tr><td>Firmware</td><td>v" FW_VERSION "</td></tr>";
     s += "<tr><td>IP</td><td>" + WiFi.localIP().toString() +
          (WifiNet::usingStaticIp() ? " (static)" : " (DHCP)") + "</td></tr>";
-    s += "<tr><td>RSSI</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
+    s += "<tr><td>RSSI</td><td>" + String(WiFi.RSSI()) + " dBm (TX " +
+         String(Config::get().txPower / 4.0, 1) + " dBm)</td></tr>";
+    {
+        // WiFi health (1.7.0): a dropout used to be invisible here -- the page
+        // read "good RSSI" while the device had been off the network for
+        // minutes. Disconnect count + last reason + reset reason answer the
+        // "why did it drop?" question from the device itself.
+        String w;
+        WifiNet::appendDiag(w);
+        s += "<tr><td>WiFi health</td><td>" + htmlEscape(w) + "</td></tr>";
+    }
     String peers = String(RtpMidi::peerCount());
     if (Config::get().targetIp.length() && RtpMidi::peerCount() == 0) {
         peers += " (inviting " + htmlEscape(Config::get().targetIp) + ":" +
@@ -146,6 +156,14 @@ String statusSection() {
         RtpMidi::appendEventLog(ev, "\n");
         if (ev.length()) {
             s += F("<details class='nets'><summary>RTP-MIDI session events</summary><pre>");
+            s += htmlEscape(ev);
+            s += F("</pre></details>");
+        }
+    }
+    {
+        String ev = WifiNet::eventLog();
+        if (ev.length()) {
+            s += F("<details class='nets'><summary>WiFi events</summary><pre>");
             s += htmlEscape(ev);
             s += F("</pre></details>");
         }
@@ -378,6 +396,18 @@ void handleRoot() {
     page += F("'><p><small class='warn'>A wrong static IP can make the device unreachable "
               "(no setup-AP fallback once WiFi itself connects). Recovery: hold BOOT for "
               "10&nbsp;s to factory-reset.</small></p>"
+              "<label>WiFi TX power</label><select name='txp'>");
+    for (uint8_t choice : Config::TX_POWER_CHOICES) {
+        page += "<option value='" + String(choice) + "'";
+        if (c.txPower == choice) page += F(" selected");
+        page += ">" + String(choice / 4.0, 1) + " dBm";
+        if (choice == Config::TX_POWER_DEFAULT) page += F(" (max)");
+        page += F("</option>");
+    }
+    page += F("</select><p><small>More power = more uplink margin. Lower it only if "
+              "serial-port glitches appear while flashing/monitoring at the bench "
+              "(full power has induced them with the UART cabled; deployed with "
+              "nothing on the UART it is harmless).</small></p>"
               "<label>Web UI password <small>(");
     page += c.webPass.length() ? F("set; blank = keep current") : F("not set; blank = stays off");
     page += F(")</small></label><input type='password' name='webpass' maxlength='63' value=''>"
@@ -505,6 +535,18 @@ void handleConfigPost() {
         v.staticGw = sgw;
         v.staticDns = sdns;
     }
+    if (server.hasArg("txp")) {
+        const String& a = server.arg("txp");
+        long n = a.toInt();
+        // Comes from a <select>, so anything outside the fixed choice list is
+        // a crafted POST -- reject rather than hand the radio a raw register
+        // value.
+        if (!allDigits(a) || !Config::txPowerValid((uint8_t)n)) {
+            server.send(400, "text/html", "Not saved: invalid WiFi TX power.");
+            return;
+        }
+        v.txPower = (uint8_t)n;
+    }
     if (server.hasArg("clearpass") && server.arg("clearpass") == "1") {
         v.webPass = "";
     } else if (server.hasArg("webpass") && server.arg("webpass").length()) {
@@ -605,6 +647,8 @@ void handleDiag() {
     s += String(MidiBridge::forwardedCount());
     s += "\nhealthy=";
     s += String(UsbMidi::healthy() ? 1 : 0);
+    s += "\nwifi=";
+    WifiNet::appendDiag(s);
     s += "\nheap=";
     s += String(ESP.getFreeHeap());
     s += "\nout=";

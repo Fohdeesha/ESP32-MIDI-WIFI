@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.6.3**
+**Current version: 1.7.0**
 
 ![The web UI: status and diagnostics above the configuration form](docs/status-page.png)
 
@@ -65,6 +65,14 @@ configurable per direction (default: the first port, both ways).
   leaving the running totals alone.
 - **Static IP or DHCP** (DHCP by default), configurable from the web UI with
   validation.
+- **WiFi health diagnostics and reconnect hardening**: every station disconnect
+  is logged and counted with its reason code (beacon timeout, AP not found,
+  auth failure, ...), a WiFi event log on the status page keeps the recent
+  history with the last-known RSSI, `/diag` carries it all in one line together
+  with the chip's last reset reason (power-on vs brownout vs crash), and a
+  station that stays down for 15 s gets an explicit reconnect kick instead of
+  trusting auto-reconnect indefinitely. TX power is configurable from the web
+  UI (default: maximum).
 - **OTA firmware updates** over HTTP — no serial connection needed once the
   device is on your network. Malformed or interrupted uploads are rejected
   safely, and a boot guard auto-rolls-back to the previous firmware if a new
@@ -194,6 +202,27 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.7.0 — **WiFi dropouts are now self-diagnosing, and TX power is
+  configurable.** A station disconnect used to change nothing but the status
+  LED: no reason code, no counter, no history — so a device that fell off the
+  network for minutes still read "good RSSI, zero errors" once it was back,
+  which is exactly what happened in a real deployment (link degraded ~20 dB
+  from its install-time survey; the dropouts were invisible from the device
+  side). Every disconnect is now logged and counted with its reason code — the
+  single most diagnostic byte a dropout produces: `BEACON_TIMEOUT` points at
+  RF/interference/power, `NO_AP_FOUND` at the AP vanishing or changing
+  channel, `AUTH_FAIL`/`ASSOC_FAIL` at AP-side refusal — a WiFi event log on
+  the status page keeps the recent history with last-known RSSI, and `/diag`
+  gains a `wifi=` line plus the chip's last reset reason (`POWERON` vs
+  `BROWNOUT` vs `PANIC` distinguishes a pulled plug from a sagging supply from
+  a crash). Recovery is hardened too: auto-reconnect has been observed wedged
+  for minutes, so a station that stays down for 15 s now gets an explicit
+  reconnect kick, repeated until the link returns. And **TX power is a config
+  setting, default 19.5 dBm (the maximum)** — it had been pinned at 11 dBm
+  since 1.5.x because full power once glitched the CH340 serial link at the
+  bench, but that only matters with the UART cabled, and a deployed link whose
+  RSSI has degraded needs the margin more; lower it from the web page if bench
+  serial glitches return.
 - 1.6.3 — **the bridge no longer rewrites null-velocity Note On as Note Off.**
   The MIDI library normalises an incoming Note On with velocity 0 into a Note
   Off by default — reasonable for a synth, wrong for a bridge, whose job is to

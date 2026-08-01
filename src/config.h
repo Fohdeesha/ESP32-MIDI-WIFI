@@ -25,11 +25,26 @@ struct Values {
     // keeps the two directions locked together, which is what a control
     // surface needs -- it expects its LEDs back on the port it sent from.
     uint8_t usbCableOut;
+    // WiFi TX power, stored as the wifi_power_t raw value (quarter-dBm: 78 =
+    // 19.5 dBm). Configurable because the right value is a trade: more power =
+    // more uplink margin against interference, but full power has glitched the
+    // CH340 serial link at the bench (RFI/current spike with an external
+    // antenna) -- harmless deployed with nothing on the UART, annoying while
+    // flashing/monitoring. Only values in TX_POWER_CHOICES are accepted.
+    uint8_t txPower;
 };
 
 constexpr uint8_t IFACE_AUTO = 0xFF;
 constexpr uint8_t CABLE_ALL = 0xFF;   // input only
 constexpr uint8_t CABLE_SAME = 0xFE;  // output only: follow the input setting
+// Allowed TX power settings (wifi_power_t raw values): 19.5 / 15 / 11 / 8.5 dBm.
+constexpr uint8_t TX_POWER_CHOICES[] = {78, 60, 44, 34};
+constexpr uint8_t TX_POWER_DEFAULT = 78;  // 19.5 dBm (max)
+inline bool txPowerValid(uint8_t v) {
+    for (uint8_t c : TX_POWER_CHOICES)
+        if (v == c) return true;
+    return false;
+}
 
 // Loads NVS-stored values; anything unset gets a safe default (no baked-in
 // credentials -- a blank config boots into the setup AP portal).
