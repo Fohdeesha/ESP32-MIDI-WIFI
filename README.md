@@ -38,9 +38,12 @@ configurable per direction (default: the first port, both ways).
 
 - **USB host** for class-compliant USB MIDI devices, including workarounds for
   common descriptor quirks (e.g. devices that report a high-speed bulk packet
-  size on a full-speed link), and automatic retry of a device that fails to
+  size on a full-speed link), automatic retry of a device that fails to
   enumerate — so a self-powered device left on while the bridge reboots is
-  picked up again without power-cycling it.
+  picked up again without power-cycling it — and recovery from USB transfer
+  errors (the endpoint is cleared and the transfer resubmitted, escalating to a
+  port reset if errors persist) instead of a direction going dead until the
+  device is replugged.
 - **Selectable MIDI port**: multi-port devices present several virtual cables
   (and occasionally several MIDI interfaces) — pick which one to bridge from
   the web UI, separately per direction if a device needs it, or merge every
@@ -49,13 +52,18 @@ configurable per direction (default: the first port, both ways).
   port your controller is really using, and warns if a selected port is beyond
   what the device declares in that direction.
 - **Bidirectional RTP-MIDI bridge** hardened for sustained high-rate traffic
-  (large parse buffer so no datagram straddles reads, deep TX queue with
+  (every network datagram parsed on its own, so a truncated or malformed one
+  costs only itself; SysEx of any length in both directions; deep TX queue with
   backpressure so device-bound SysEx bursts don't tear) and for low latency:
   the main loop is kept free of blocking calls, including in the upstream
   AppleMIDI library, and runs at ~480 Hz under a heavy bidirectional load.
+  Channel messages, SysEx, and MIDI clock, transport and timecode (System
+  Real-Time and System Common) all pass both ways.
 - **Session listener and initiator**: by default the device accepts incoming
   AppleMIDI invitations; optionally configure a peer IP:port and it will
-  initiate (and re-invite every 30 s until connected).
+  initiate (and re-invite every 30 s until connected). A host that vanishes
+  without ending its session (asleep, crashed, out of range) is dropped after
+  150 s without clock sync, and the attached surface blanked.
 - **Web config UI** (`http://esp32-midi.local/`): status, WiFi and network
   settings, RTP-MIDI session settings, MIDI port selection, password
   management, reboot, factory reset, and a live diagnostics view in collapsible
@@ -65,7 +73,11 @@ configurable per direction (default: the first port, both ways).
   log, USB descriptor dump). A plain-text `/diag` endpoint carries the same counters
   in a few hundred bytes, cheap enough to poll once a second while measuring
   throughput; `POST /diagreset` zeroes the diagnostic counters for a fresh run,
-  leaving the running totals alone.
+  leaving the running totals alone. Settings-changing requests from other
+  websites are refused, so a page open in the same browser can't reconfigure,
+  reflash or reset the bridge with its stored login; settings can be changed
+  only with the page opened as `http://esp32-midi.local/` or by IP address
+  (another DNS name for the device can view it, not change it).
 - **Static IP or DHCP** (DHCP by default), configurable from the web UI with
   validation.
 - **WiFi health diagnostics and reconnect hardening**: every station disconnect
@@ -79,9 +91,12 @@ configurable per direction (default: the first port, both ways).
 - **OTA firmware updates** over HTTP — no serial connection needed once the
   device is on your network. Malformed or interrupted uploads are rejected
   safely, and a boot guard auto-rolls-back to the previous firmware if a new
-  image crash-loops (3 failed boots).
-- **Setup AP fallback**: if the configured WiFi is unreachable for 30 s, the
-  device opens its own configuration access point while continuing to retry.
+  image crash-loops (3 boots in a row ending in a crash; power cuts don't
+  count). A watchdog turns a hang into such a crash, so a hung bridge also
+  restarts itself.
+- **Setup AP fallback**: if the configured WiFi has been unreachable for 30 s
+  in a row, the device opens its own configuration access point while
+  continuing to retry, and closes it once the station is back.
 - **WS2812 status LED**: WiFi/session state and MIDI activity at a glance.
 - **No baked-in credentials**: all configuration lives in NVS flash, never in
   the source or the binary.
@@ -127,11 +142,17 @@ pio run -t upload        # first flash (via the UART port)
 pio device monitor       # serial console, 115200 baud
 ```
 
-The build runs `tools/patch_applemidi.py` first, which removes a per-SysEx-byte
-`Serial.print` from the AppleMIDI dependency — left-over debug code in its only
-release, and enough to stall the main loop for hundreds of milliseconds under a
-SysEx load (see 1.5.0 below). The script is idempotent and fails the build if
-that code ever changes upstream, so the fix can't silently lapse.
+The build runs `tools/patch_applemidi.py` first, which fixes bugs in the
+AppleMIDI dependency's only release (3.3.0): a per-SysEx-byte `Serial.print`
+left in as debug code (enough to stall the main loop for hundreds of
+milliseconds under a SysEx load, see 1.5.0), a session timeout that this
+build's initiator support compiled out, a lost invitation reply that locked a
+peer out, recovery-journal and datagram parsing that spliced one packet into
+the next, and phantom packet-loss reports at every sequence-number wrap (see
+1.7.2). Each patch is an exact-text replacement: the script is idempotent,
+fails the build if the library ever changes upstream, and stamps the patched
+copy with a version that the firmware checks at compile time — so it can
+never be built against an unpatched library.
 
 Subsequent updates can go over the air instead:
 
@@ -194,7 +215,8 @@ Everything is set from the web UI:
   the device unreachable; recovery is the BOOT-button factory reset below.
 - **Web UI password**: HTTP Basic auth (username `admin`) guarding the page,
   config changes, OTA uploads, reboot, and factory reset. Default `midimidi`;
-  changeable or removable.
+  changeable or removable. Changes (including OTA uploads, also via `curl`)
+  are accepted only for `esp32-midi.local` or the device's IP address.
 
 Reboot (keeps all settings): button on the config page beside **Save &
 reboot**, for a remote power-cycle equivalent.
@@ -205,6 +227,58 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.7.2 — **a full-code audit; every fix below is proven by a host-side test
+  that fails on 1.7.1.** **Sessions:** a DAW that disappeared without ending
+  its session (Mac asleep or crashed, out of WiFi range) stayed "connected"
+  forever — the AppleMIDI library's session timeout was compiled out by the
+  flag this build needs for initiator mode — so the surface was never blanked,
+  and after two such losses every new invitation was refused until reboot.
+  Such a session now ends after 150 s without clock sync. A lost reply to a
+  DAW's invitation no longer locks that DAW out (its retry is answered again),
+  and the connected-peer count can no longer drift on the library's duplicate
+  or phantom callbacks: it used to stay at 1 after the last session ended (no
+  blanking, and initiator mode never re-invited) or fall to 0 under a live
+  session (surface blanked, device → network muted). **Network parsing:** each
+  RTP-MIDI datagram is now parsed on its own. A truncated, malformed or
+  multi-channel-journal packet used to be spliced into the next one — garbage
+  MIDI to the device and swallowed clock-sync replies — and every
+  sequence-number wrap logged phantom packet loss. **SysEx:** messages over 128
+  bytes from the DAW reached the device torn (the MIDI library's internal
+  segments were each sent as a complete message, markers included); they are
+  stitched back into one. Device SysEx over 256 bytes was dropped; any length
+  now goes out, segmented per RFC 6295, with one loop's output always inside a
+  single WiFi datagram. A SysEx left unfinished is closed before anything else
+  reaches the device. **MIDI clock, transport and timecode** now pass in both
+  directions (they were dropped). **USB:** a transfer error used to leave that
+  direction dead until the device was replugged; the endpoint is now cleared
+  and the transfer resubmitted, escalating to a port reset if errors persist.
+  A device that stops accepting data no longer stalls the main loop 20 ms per
+  message, malformed descriptors can no longer be read past their end, a
+  failed interface claim no longer overflows the heap, the IN-pipeline line
+  counts packets lost to a full queue (`qdrop`), and the **USB port** row counts
+  pipe clears and port resets. **WiFi:** after the first
+  30 s of uptime, any momentary drop switched the radio into setup-AP mode in
+  the middle of its own reconnect; the setup AP now opens only after 30 s down
+  in a row, and every WiFi mode change is made from the main loop instead of
+  racing it from the WiFi event task. The WiFi event log no longer freezes
+  after 255 events. **Boot guard:** only crash resets count toward the
+  automatic rollback — three quick power cycles (a battery bank cutting out)
+  used to roll the firmware back to the previous version — and a 30 s loop
+  watchdog now turns a hang into such a crash, so a hung bridge restarts
+  itself (and a new image that hangs is rolled back too). **Web UI:**
+  settings-changing requests from other websites are refused (Basic auth alone
+  let any page open in a logged-in browser reconfigure, reflash or reset the
+  bridge), and so are those addressed to a name other than
+  `esp32-midi.local` or an IP address (DNS rebinding); displayed settings are
+  HTML-escaped; inputs are length-checked
+  (including a web password long enough to overflow the Arduino core's auth
+  buffer) and static-IP settings that would leave the device unreachable are
+  rejected; a settings save that fails to reach flash is reported (and the
+  previous settings are put back) instead of "Saved" and then lost at the
+  reboot; an OTA upload with no file is refused cleanly. The RTP-MIDI session log is rate-limited per exception type (one
+  burst of junk used to rewrite its whole history) and ends with exact totals,
+  and the status LED is decided in one place, so a session that survives a
+  WiFi reconnect is shown as a session.
 - 1.7.1 — **a device that fails its first enumeration is retried instead of
   abandoned.** ESP-IDF 4.4's USB host makes exactly one enumeration attempt per
   connection; if it fails, the stack waits for the device to disconnect before

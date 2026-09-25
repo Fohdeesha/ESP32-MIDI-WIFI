@@ -4,12 +4,14 @@
 
 namespace WifiNet {
 // Starts station-mode WiFi and mDNS advertisement. Non-blocking; connection
-// state is reported via WiFi events and shown on the status LED. Uses the
+// state is tracked from WiFi events and acted on in tick(). Uses the
 // config's WiFi credentials and, when set, its static IP settings (blank
 // static IP = DHCP) and TX power.
 void begin(const Config::Values& cfg, const char* hostname);
 void tick();          // call from loop
-bool isConnected();
+bool isConnected();    // station has an IP
+bool portalActive();   // the setup AP is up
+const char* hostname();  // mDNS name, without ".local"
 bool usingStaticIp();  // true if a valid static IP config was applied
 
 // ── WiFi health diagnostics (1.7.0) ─────────────────────────────────────────

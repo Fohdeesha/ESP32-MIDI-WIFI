@@ -51,4 +51,8 @@ void rtpAfterTouch(uint8_t channel, uint8_t pressure);
 void rtpAfterTouchPoly(uint8_t channel, uint8_t note, uint8_t pressure);
 void rtpPitchBend(uint8_t channel, int value);  // -8192..8191
 void rtpSysEx(const uint8_t* data, uint16_t length);
+// status 0xF1/0xF2/0xF3/0xF6 with its data bytes (d1 = LSB for 0xF2).
+void rtpSystemCommon(uint8_t status, uint8_t d1, uint8_t d2);
+// status 0xF8-0xFF.
+void rtpRealTime(uint8_t status);
 }  // namespace MidiBridge

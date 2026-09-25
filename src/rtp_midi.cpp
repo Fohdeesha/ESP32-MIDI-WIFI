@@ -6,29 +6,43 @@
 
 #include "config.h"
 #include "midi_bridge.h"
-#include "status_led.h"
+
+// tools/patch_applemidi.py fixes a set of AppleMIDI 3.3.0 bugs at build time
+// (a session the DAW opened never timing out, a lost OK locking a peer out,
+// journal and datagram parsing -- see the script). Never build against a copy
+// it has not patched, or has patched with an older set.
+#if !defined(ESP32_MIDI_WIFI_APPLEMIDI_PATCHSET) || ESP32_MIDI_WIFI_APPLEMIDI_PATCHSET != 2
+#error "AppleMIDI is unpatched or stale: delete .pio/libdeps and rebuild (tools/patch_applemidi.py)"
+#endif
 
 // Defines global session + MIDI interface objects (AppleMIDI, MIDI).
 // Must appear in exactly one translation unit -- keep it in this .cpp only.
 // The name here is a placeholder; begin() sets the configured name.
 //
-// Custom settings instead of APPLEMIDI_CREATE_INSTANCE: the parse buffer must
-// hold a whole WiFi datagram. The lathoub rtpMIDI parser keeps state ACROSS
-// datagrams (headers-complete flag + command-section countdown over the
-// concatenated byte stream), so with the stock 64-byte buffer any datagram
-// larger than 64 bytes parses straddling reads -- and one lost datagram
-// mid-packet splices the next packet's bytes into the previous command
-// section. A garbage length field read that way makes the parser swallow the
-// slow trickle of session commands (CK1 answers, invite OKs) for minutes:
-// sessions then die with MaxAttempts / NoResponseFromConnectionRequest over
-// and over until reboot -- the exact wedge a busy MIDI host's display load
-// exposes. Sized so every datagram is parsed whole and the parser state
-// returns to idle at each datagram boundary, so a lost packet costs only its
-// own contents: 2048 covers the largest unfragmented UDP payload a 1500-byte
-// MTU allows (1472) with margin for lwIP handing up a small IP-reassembled
-// datagram, which would otherwise straddle the buffer the same way.
+// Custom settings instead of APPLEMIDI_CREATE_INSTANCE.
+//
+// MaxBufferSize: the parse buffer must hold a whole WiFi datagram. With the
+// stock 64 bytes a datagram was parsed straddling reads, and the parser kept
+// its state across datagrams, so one lost or truncated datagram spliced the
+// next packet's bytes into its command section. A garbage length field read
+// that way swallowed the slow trickle of session commands (CK1 answers, invite
+// OKs) for minutes: sessions died with MaxAttempts /
+// NoResponseFromConnectionRequest over and over until reboot -- the exact
+// wedge a busy MIDI host's display load exposed. WiFiUDP hands over at most
+// 1460 bytes of a datagram (it truncates anything longer), so 2048 always
+// holds one whole, and the patched library parses each datagram on its own
+// and drops whatever it leaves (1.7.2): a bad or truncated datagram costs only
+// its own contents.
+//
+// CK_MaxTimeOut: a session the DAW opened is ended (BY sent, surface blanked)
+// after this long without a clock-sync exchange from it. The protocol has the
+// initiator sync at least once every 60 s; 150 s rides out a lost sync even
+// at that slowest legal cadence. (Until 1.7.2 this build never applied the
+// timeout at all -- see the listener-timeout patch -- so a DAW that vanished
+// without a BY stayed "connected" forever.)
 struct EspMidiSettings : public APPLEMIDI_NAMESPACE::DefaultSettings {
     static const size_t MaxBufferSize = 2048;
+    static const unsigned long CK_MaxTimeOut = 150000;
 };
 using EspMidiSession = APPLEMIDI_NAMESPACE::AppleMIDISession<WiFiUDP, EspMidiSettings>;
 EspMidiSession AppleMIDI("ESP32-MIDI", 5004);
@@ -61,14 +75,33 @@ MIDI_NAMESPACE::MidiInterface<EspMidiSession, EspMidiInterfaceSettings> MIDI(App
 
 namespace {
 bool started = false;
-int s_peerCount = 0;
 uint32_t s_lastInviteMs = 0;
+
+// Connected sessions, by the peer's SSRC (1.7.2). The library's callbacks do
+// not map one-to-one onto sessions: "connected" fires again for a
+// retransmitted data-port IN or a late duplicate OK, and "disconnected" also
+// fires for an invitation that never connected or a half-open session timing
+// out. The plain counter this replaces drifted on each of those -- left at 1
+// after the last session ended (no blanking, and inviteTick() never inviting
+// again) or dropped to 0 under a live one (surface blanked, USB->RTP muted).
+// Keyed by identity, every callback is idempotent.
+constexpr int MAX_PEERS = EspMidiSettings::MaxNumberOfParticipants;
+constexpr size_t PEER_NAME_LEN = EspMidiSettings::MaxSessionNameLen;
+APPLEMIDI_NAMESPACE::ssrc_t s_peerSsrc[MAX_PEERS];
+char s_peerName[MAX_PEERS][PEER_NAME_LEN + 1];
+int s_peerCount = 0;
+
+int findPeer(APPLEMIDI_NAMESPACE::ssrc_t ssrc) {
+    for (int i = 0; i < s_peerCount; i++)
+        if (s_peerSsrc[i] == ssrc) return i;
+    return -1;
+}
 
 // Session-event ring for the web UI: connects, disconnects and library
 // exceptions with uptime stamps, so session drops are diagnosable on a
 // headless device (serial is unplugged while the board sits at the P1-M).
 constexpr int EVLOG_SIZE = 24;
-char s_evlog[EVLOG_SIZE][48];
+char s_evlog[EVLOG_SIZE][64];
 int s_evlogNext = 0;
 
 void evlog(const char* fmt, ...) {
@@ -89,33 +122,45 @@ const char* const EXCEPTION_NAMES[] = {
     "NoResponseFromConnectionRequest", "SendPacketsDropped",
     "ReceivedPacketsDropped", "UdpBeginPacketFailed"};
 
-// Repeat suppression for the event ring (1.5.4). "No bridge is listening yet"
-// is this device's EXPECTED idle state, not an exception worth a ring slot: the
-// 30 s invite retry wrote TWO entries per attempt (this, plus a phantom
-// disconnect), so the 24-entry ring held only ~6 minutes and evicted anything
-// genuinely diagnostic -- a real session drop, a USB error -- within minutes of
-// it happening. Measured 2026-07-29: 25.7 h of uptime showed four minutes of
-// history. Log the first of a run, then one summary per EX_SUMMARY_EVERY.
-constexpr uint32_t EX_SUMMARY_EVERY = 20;  // ~10 min at the 30 s retry cadence
-int s_lastExCode = -1;
-uint32_t s_exRepeat = 0;
+constexpr size_t EX_KINDS = sizeof(EXCEPTION_NAMES) / sizeof(EXCEPTION_NAMES[0]);
+
+// Rate limit for the event ring, per exception kind: the first occurrence is
+// logged, then at most one line per EX_LOG_GAP_MS, carrying the number held
+// back since the previous line; exact totals follow the ring on the page.
+// "No bridge is listening yet" is this device's EXPECTED idle state in
+// initiator mode, not something worth a slot every 30 s: that evicted anything
+// genuinely diagnostic within minutes (1.5.4 -- measured, 25.7 h of uptime
+// showed four minutes of history). Bursts are the other hazard (1.7.2): one
+// junk datagram used to raise an exception per byte, and the old count-based
+// summary (a line per 20) turned that into dozens of lines that rewrote the
+// whole ring at once.
+constexpr uint32_t EX_LOG_GAP_MS = 10 * 60 * 1000;
+struct ExLog {
+    bool seen;
+    uint32_t lastMs;
+    uint32_t heldBack;
+    uint32_t total;
+};
+ExLog s_exLog[EX_KINDS + 1];  // + one slot for codes this build has no name for
 
 void onException(const APPLEMIDI_NAMESPACE::ssrc_t&,
                  const APPLEMIDI_NAMESPACE::Exception& e, const int32_t value) {
-    const char* name = (e < sizeof(EXCEPTION_NAMES) / sizeof(EXCEPTION_NAMES[0]))
-                           ? EXCEPTION_NAMES[e]
-                           : "?";
-    if (static_cast<int>(e) == s_lastExCode) {
-        if (++s_exRepeat % EX_SUMMARY_EVERY == 0)
-            evlog("EX %s x%lu (still retrying)", name,
-                  (unsigned long)s_exRepeat);
+    const size_t kind = static_cast<size_t>(e) < EX_KINDS ? static_cast<size_t>(e) : EX_KINDS;
+    const char* name = kind < EX_KINDS ? EXCEPTION_NAMES[kind] : "?";
+    ExLog& ex = s_exLog[kind];
+    ex.total++;
+    const uint32_t now = millis();
+    if (ex.seen && now - ex.lastMs < EX_LOG_GAP_MS) {
+        ex.heldBack++;
         return;
     }
-    if (s_exRepeat > 0)
-        evlog("EX (previous repeated x%lu)", (unsigned long)s_exRepeat);
-    s_lastExCode = static_cast<int>(e);
-    s_exRepeat = 0;
-    evlog("EX %s (%ld)", name, (long)value);
+    if (ex.heldBack > 0)
+        evlog("EX %s (%ld) +%lu more", name, (long)value, (unsigned long)ex.heldBack);
+    else
+        evlog("EX %s (%ld)", name, (long)value);
+    ex.seen = true;
+    ex.lastMs = now;
+    ex.heldBack = 0;
 }
 
 // Initiator mode (0.8.0): when a peer target is configured and no session
@@ -140,23 +185,37 @@ void inviteTick() {
     }
 }
 
-void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/, const char* name) {
-    s_peerCount++;
-    evlog("connected \"%s\" (peers %d)", (name && name[0]) ? name : "?", s_peerCount);
-    StatusLed::set(LedStatus::SessionActive);
+void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& ssrc, const char* name) {
+    int i = findPeer(ssrc);
+    if (i >= 0) {
+        // The peer re-sent its IN or OK: the session was already up.
+        evlog("re-connected \"%s\" (peers %d)", s_peerName[i], s_peerCount);
+        return;
+    }
+    if (s_peerCount == MAX_PEERS) return;  // cannot happen: the library caps it
+    i = s_peerCount++;
+    s_peerSsrc[i] = ssrc;
+    // The library's copy may lack its terminator (fixed by the name-nul
+    // patch); never read past the field either way.
+    snprintf(s_peerName[i], sizeof(s_peerName[i]), "%.*s", (int)PEER_NAME_LEN,
+             (name && name[0]) ? name : "?");
+    evlog("connected \"%s\" (peers %d)", s_peerName[i], s_peerCount);
 }
 
-void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& /*ssrc*/) {
-    // A failed INVITE also lands here when the library cleans up the participant
-    // it never established, with the count already 0 (1.5.4). That is not a
-    // disconnect: logging it filled the ring every 30 s, and re-blanking the
-    // surface each time sent ~110 pointless USB messages. A session that really
-    // ended always has a peer to lose first.
-    if (s_peerCount == 0) return;
+void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& ssrc) {
+    // Also fired for sessions that never connected -- a failed invitation, a
+    // half-open one timing out. Not a disconnect: logging those filled the
+    // ring every 30 s, and re-blanking the surface each time sent ~110
+    // pointless USB messages (1.5.4).
+    const int i = findPeer(ssrc);
+    if (i < 0) return;
+    evlog("disconnected \"%s\" (peers %d)", s_peerName[i], s_peerCount - 1);
     s_peerCount--;
-    evlog("disconnected (peers %d)", s_peerCount);
+    if (i != s_peerCount) {  // move the last entry into the gap
+        s_peerSsrc[i] = s_peerSsrc[s_peerCount];
+        memcpy(s_peerName[i], s_peerName[s_peerCount], sizeof(s_peerName[i]));
+    }
     if (s_peerCount == 0) {
-        StatusLed::set(LedStatus::WifiConnected);
         // An orphaned surface must not keep showing the dead session's last
         // frame as if it were live -- dark is honest (1.2.0).
         MidiBridge::blankSurface();
@@ -175,6 +234,19 @@ void onRxAfterTouchPoly(byte ch, byte note, byte pressure) {
 }
 void onRxPitchBend(byte ch, int bend) { MidiBridge::rtpPitchBend(ch, bend); }
 void onRxSysEx(byte* data, unsigned size) { MidiBridge::rtpSysEx(data, (uint16_t)size); }
+// System Common and Real-Time (1.7.2): MIDI clock, transport and timecode.
+void onRxTimeCodeQuarterFrame(byte data) { MidiBridge::rtpSystemCommon(0xF1, data, 0); }
+void onRxSongPosition(unsigned beats) {
+    MidiBridge::rtpSystemCommon(0xF2, beats & 0x7F, (beats >> 7) & 0x7F);
+}
+void onRxSongSelect(byte song) { MidiBridge::rtpSystemCommon(0xF3, song, 0); }
+void onRxTuneRequest() { MidiBridge::rtpSystemCommon(0xF6, 0, 0); }
+void onRxClock() { MidiBridge::rtpRealTime(0xF8); }
+void onRxStart() { MidiBridge::rtpRealTime(0xFA); }
+void onRxContinue() { MidiBridge::rtpRealTime(0xFB); }
+void onRxStop() { MidiBridge::rtpRealTime(0xFC); }
+void onRxActiveSensing() { MidiBridge::rtpRealTime(0xFE); }
+void onRxSystemReset() { MidiBridge::rtpRealTime(0xFF); }
 }  // namespace
 
 void RtpMidi::begin() {
@@ -191,6 +263,16 @@ void RtpMidi::begin() {
     MIDI.setHandleAfterTouchPoly(onRxAfterTouchPoly);
     MIDI.setHandlePitchBend(onRxPitchBend);
     MIDI.setHandleSystemExclusive(onRxSysEx);
+    MIDI.setHandleTimeCodeQuarterFrame(onRxTimeCodeQuarterFrame);
+    MIDI.setHandleSongPosition(onRxSongPosition);
+    MIDI.setHandleSongSelect(onRxSongSelect);
+    MIDI.setHandleTuneRequest(onRxTuneRequest);
+    MIDI.setHandleClock(onRxClock);
+    MIDI.setHandleStart(onRxStart);
+    MIDI.setHandleContinue(onRxContinue);
+    MIDI.setHandleStop(onRxStop);
+    MIDI.setHandleActiveSensing(onRxActiveSensing);
+    MIDI.setHandleSystemReset(onRxSystemReset);
     MIDI.begin(MIDI_CHANNEL_OMNI);
     started = true;
     Serial.printf("[rtp] session \"%s\" listening on UDP 5004/5005\n",
@@ -210,7 +292,16 @@ void RtpMidi::tick() {
     // the buffer full, CK0/CK1 sync starves, and the library ends the session
     // (BY) after MaxSynchronizationCK0Attempts (~60 s). The bound keeps a
     // flood from starving WiFi/web handling in loop().
-    for (int i = 0; i < 128 && MIDI.read(); i++) {
+    //
+    // read() returning false is NOT "nothing left" (1.7.2): it is also what
+    // the MIDI library returns after handing over each 128-byte piece of a
+    // longer SysEx (and after a parse error). Stopping there spread a 1.4 kB
+    // display frame over 12 loop passes, with the library's socket reads and
+    // session upkeep skipped for all of them. Stop when the session has no
+    // buffered input instead; available() is exactly what read() would call
+    // next, so asking it costs nothing a further read wouldn't.
+    for (int i = 0; i < 128; i++) {
+        if (!MIDI.read() && AppleMIDI.available() == 0) break;
     }
     inviteTick();
 }
@@ -255,6 +346,24 @@ void RtpMidi::sendSysEx(const uint8_t* data, uint16_t length) {
     if (started && s_peerCount > 0) MIDI.sendSysEx(length, data, true);
 }
 
+void RtpMidi::sendSystemCommon(uint8_t status, uint8_t d1, uint8_t d2) {
+    if (!started || s_peerCount == 0) return;
+    switch (status) {
+        case 0xF1: MIDI.sendTimeCodeQuarterFrame(d1 & 0x7F); break;
+        case 0xF2: MIDI.sendSongPosition((d1 & 0x7F) | ((d2 & 0x7F) << 7)); break;
+        case 0xF3: MIDI.sendSongSelect(d1 & 0x7F); break;
+        case 0xF6: MIDI.sendTuneRequest(); break;
+        default: break;
+    }
+}
+
+void RtpMidi::sendRealTime(uint8_t status) {
+    // 0xFE toward the host is the bridge's own heartbeat only (see the header).
+    if (!started || s_peerCount == 0 || status == 0xFE) return;
+    // The library sends F8, FA, FB, FC and FF and ignores anything else.
+    MIDI.sendRealTime(static_cast<midi::MidiType>(status));
+}
+
 void RtpMidi::sendActiveSensing() {
     if (started && s_peerCount > 0)
         MIDI.sendRealTime(midi::ActiveSensing);
@@ -267,4 +376,15 @@ void RtpMidi::appendEventLog(String& out, const char* sep) {
         out += line;
         out += sep;
     }
+    // Exact per-kind totals since boot, which the ring's rate limit hides.
+    bool any = false;
+    for (size_t k = 0; k <= EX_KINDS; k++) {
+        if (s_exLog[k].total == 0) continue;
+        out += any ? ", " : "exceptions since boot: ";
+        out += k < EX_KINDS ? EXCEPTION_NAMES[k] : "?";
+        out += " x";
+        out += String((unsigned long)s_exLog[k].total);
+        any = true;
+    }
+    if (any) out += sep;
 }

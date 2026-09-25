@@ -32,20 +32,25 @@ void begin(uint8_t preferredInterface);
 // empty. Call from loop context only.
 bool readPacket(uint8_t out[4]);
 // Queues one 4-byte USB-MIDI event packet for transmission to the device.
-// Waits up to 20 ms for queue space (burst backpressure); returns false when
-// no device is attached or the queue stayed full.
+// While the device is accepting packets, waits up to 20 ms for queue space
+// (burst backpressure); returns false when no device is attached, the queue
+// stayed full, or -- at once, without waiting -- the OUT side is stuck (a
+// transfer unaccepted for 100 ms, a halted pipe, a recovery reset pending).
 bool writePacket(const uint8_t pkt[4]);
 uint32_t txPacketCount();  // packets confirmed delivered on the wire
-uint32_t txDropCount();    // packets lost to a full TX queue despite the wait
+// Packets that never reached the device: refused by a full or stuck queue,
+// lost with an OUT transfer that failed, or still queued at detach/attach.
+uint32_t txDropCount();
 bool deviceConnected();
 // True while the attached device is demonstrably WORKING, not merely present:
-// connected AND the IN pipeline has live transfers (an errored-idle RX pipe is
-// a deaf device that still enumerates -- only checked when the claimed
-// interface actually has an IN endpoint) AND no OUT transfer has sat unACKed
-// for >2 s (a healthy bulk OUT completes in under a millisecond; a wedged
-// device controller can NAK forever while still looking attached). This is
-// what gates the session health heartbeat -- the bridge must never claim a
-// device it cannot actually talk to is alive.
+// connected, no endpoint-recovery port reset pending, the IN pipeline has live
+// transfers (an errored-idle RX pipe is a deaf device that still enumerates --
+// only checked when the claimed interface actually has an IN endpoint), the
+// OUT pipe is not halted, and no OUT transfer has sat unACKed for >2 s (a
+// healthy bulk OUT completes in under a millisecond; a wedged device
+// controller can NAK forever while still looking attached). This is what
+// gates the session health heartbeat -- the bridge must never claim a device
+// it cannot actually talk to is alive.
 bool healthy();
 const char* deviceName();  // product string of the attached device, "" if none
 const char* statusText();  // human-readable host state for the web UI
@@ -97,7 +102,8 @@ void appendTxDiag(String& out);
 uint32_t enumRetryCount();
 // One line: what is physically on the port ("no device detected", "device
 // detected, not enumerated", "device detected, port reset failed",
-// "enumerated, not claimed", "attached") plus the retry count. "No device
+// "enumerated, not claimed", "attached") plus the retry count, and how often
+// endpoint recovery cleared a pipe or reset the port (1.7.2). "No device
 // detected" with a device plugged in and switched on means the device is not
 // presenting itself on the bus at all (no D+/D- pull-up: its USB side is off,
 // waiting for VBUS, or the cable is bad), which no retry on this side can fix.

@@ -4,15 +4,17 @@
 #include <WiFi.h>
 #include <esp_system.h>
 
-#include "status_led.h"
-
 namespace {
 const char* s_hostname = "esp32-midi";
 bool mdnsUp = false;
-bool apActive = false;
+bool apActive = false;          // loop task only (see tick())
 bool staticApplied = false;
-uint32_t beginMs = 0;
 String s_ssid;                  // for the reconnect kick (empty = unconfigured)
+// Station link state, written by the WiFi event task: up from GOT_IP until a
+// disconnect or LOST_IP. Not WiFi.status(): the core leaves that reading
+// WL_CONNECTED across an AUTH_EXPIRE disconnect.
+volatile bool s_staUp = false;
+bool s_wasUp = false;           // loop task: the state tick() last acted on
 
 // ── WiFi health diagnostics (1.7.0) ─────────────────────────────────────────
 // The pre-1.7.0 disconnect handler only changed the LED: no reason code, no
@@ -26,8 +28,15 @@ struct WifiEv {
     int8_t rssi;       // last known RSSI before the event
 };
 constexpr uint8_t EV_RING = 16;
+// Written from two tasks (the WiFi event task records connects/disconnects,
+// the loop task its reconnect kicks), so every access holds s_evMux.
+portMUX_TYPE s_evMux = portMUX_INITIALIZER_UNLOCKED;
 WifiEv s_evRing[EV_RING];
-uint8_t s_evCount = 0;   // total recorded (ring keeps the newest EV_RING)
+// Total recorded; the ring keeps the newest EV_RING. A uint8_t that stopped
+// at 255 until 1.7.2 -- after which every new event overwrote one slot and
+// the log froze, oldest-first order broken, just when an unstable link had
+// produced the most history worth reading.
+uint32_t s_evCount = 0;
 uint32_t s_discCount = 0;
 uint32_t s_kickCount = 0;
 uint8_t s_lastReason = 0;
@@ -35,11 +44,14 @@ int8_t s_lastRssi = 0;          // refreshed while connected (RSSI reads garbage
                                 // once the link is gone, so keep the last good one)
 uint32_t s_lastRssiMs = 0;
 uint32_t s_lastKickMs = 0;
-uint32_t s_disconnectedSinceMs = 0;  // 0 = not currently disconnected
+uint32_t s_disconnectedSinceMs = 0;  // loop task; 0 = not currently disconnected
 
 void recordEv(uint8_t kind, uint8_t reason) {
-    s_evRing[s_evCount % EV_RING] = {millis() / 1000, kind, reason, s_lastRssi};
-    if (s_evCount < 0xFF) s_evCount++;
+    const WifiEv e = {(uint32_t)(millis() / 1000), kind, reason, s_lastRssi};
+    portENTER_CRITICAL(&s_evMux);
+    s_evRing[s_evCount % EV_RING] = e;
+    s_evCount++;
+    portEXIT_CRITICAL(&s_evMux);
 }
 
 // Names for the disconnect reasons this class of dropout actually produces
@@ -68,8 +80,8 @@ String reasonText(uint8_t r) {
     return String(r);
 }
 
-// If station connect hasn't succeeded by then, open a setup AP so the web
-// config UI stays reachable (e.g. after a bad SSID/password was saved).
+// If the station has been down this long, open a setup AP so the web config
+// UI stays reachable (e.g. after a bad SSID/password was saved).
 constexpr uint32_t AP_FALLBACK_MS = 30000;
 constexpr const char* AP_SSID = "ESP32-MIDI-Setup";
 // WPA2 minimum is 8 chars; "midi" alone is rejected by softAP()
@@ -92,9 +104,16 @@ void startPortal() {
     apActive = true;
     WiFi.mode(WIFI_AP_STA);  // keep retrying the station side if configured
     WiFi.softAP(AP_SSID, AP_PASSWORD);
-    StatusLed::set(LedStatus::PortalActive);
     Serial.printf("[net] setup AP \"%s\" up at %s\n",
                   AP_SSID, WiFi.softAPIP().toString().c_str());
+}
+
+void closePortal() {
+    if (!apActive) return;
+    Serial.println("[net] station up, closing setup AP");
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    apActive = false;
 }
 
 // Applies the configured static IP before WiFi.begin(). Any invalid value
@@ -135,23 +154,23 @@ bool applyStaticIp(const Config::Values& cfg) {
     return true;
 }
 
+// Runs in the core's WiFi event task, NOT the loop task: it only records what
+// happened. Everything that acts on it -- closing the setup AP, starting mDNS,
+// the LED -- happens in the loop task (tick(), main.cpp). Until 1.7.2 this
+// handler closed the AP itself, racing tick()'s decision to open it: a portal
+// opened just after the station came up then stayed up while connected.
 void onWifiEvent(WiFiEvent_t event, arduino_event_info_t info) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
             s_lastRssi = WiFi.RSSI();
-            s_disconnectedSinceMs = 0;
+            s_staUp = true;
             recordEv(1, 0);
             Serial.printf("[net] connected, IP %s (RSSI %d dBm, TX %.1f dBm)\n",
                           WiFi.localIP().toString().c_str(), WiFi.RSSI(),
                           Config::get().txPower / 4.0);
-            if (apActive) {
-                Serial.println("[net] station up, closing setup AP");
-                WiFi.softAPdisconnect(true);
-                WiFi.mode(WIFI_STA);
-                apActive = false;
-            }
-            StatusLed::set(LedStatus::WifiConnected);
-            startMdns();
+            break;
+        case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+            s_staUp = false;
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
             // The reason code is the single most diagnostic byte a dropout
@@ -159,13 +178,12 @@ void onWifiEvent(WiFiEvent_t event, arduino_event_info_t info) {
             // the AP vanished or changed channel, AUTH_/ASSOC_FAIL = AP-side
             // refusal. Log it, count it, remember it.
             const uint8_t r = info.wifi_sta_disconnected.reason;
+            s_staUp = false;
             s_discCount++;
             s_lastReason = r;
-            if (!s_disconnectedSinceMs) s_disconnectedSinceMs = millis() ? millis() : 1;
             recordEv(0, r);
             Serial.printf("[net] station DISCONNECTED, reason %s (disconnect #%lu, last RSSI %d dBm)\n",
                           reasonText(r).c_str(), (unsigned long)s_discCount, s_lastRssi);
-            if (!apActive) StatusLed::set(LedStatus::WifiConnecting);
             break;
         }
         default:
@@ -177,14 +195,12 @@ void onWifiEvent(WiFiEvent_t event, arduino_event_info_t info) {
 void WifiNet::begin(const Config::Values& cfg, const char* hostname) {
     s_hostname = hostname;
     s_ssid = cfg.wifiSsid;
-    beginMs = millis();
     Serial.printf("[net] reset reason: %s\n", WifiNet::resetReasonName());
     if (!cfg.wifiSsid.length()) {
         Serial.println("[net] no WiFi configured -- starting setup portal");
         startPortal();
         return;
     }
-    StatusLed::set(LedStatus::WifiConnecting);
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname);
     WiFi.setSleep(false);  // modem sleep adds latency spikes -- unacceptable for MIDI
@@ -207,39 +223,62 @@ void WifiNet::begin(const Config::Values& cfg, const char* hostname) {
 
 void WifiNet::tick() {
     const uint32_t now = millis();
-    if (WiFi.status() == WL_CONNECTED) {
+    const bool up = s_staUp;
+    if (up != s_wasUp) {
+        s_wasUp = up;
+        if (up) {
+            s_disconnectedSinceMs = 0;
+            closePortal();
+            startMdns();
+        }
+    }
+    if (up) {
         // Keep a last-known-good RSSI for the diagnostics: once the link is
         // gone, WiFi.RSSI() no longer means anything.
         if (now - s_lastRssiMs > 2000) {
             s_lastRssiMs = now;
             s_lastRssi = WiFi.RSSI();
         }
-    } else if (s_ssid.length()) {
-        // RECONNECT KICK (1.7.0): setAutoReconnect(true) is trusted to bring
-        // the station back, but it retries on its own schedule and has been
-        // observed wedged for minutes. If we have been disconnected for 15 s,
-        // force a fresh association attempt ourselves, and keep forcing one
-        // every 15 s until the link is back. Composes with the setup-AP
-        // fallback below (AP_STA keeps retrying the station side).
-        if (!s_disconnectedSinceMs) s_disconnectedSinceMs = now ? now : 1;
-        if (now - s_disconnectedSinceMs > 15000 && now - s_lastKickMs > 15000) {
-            s_lastKickMs = now;
-            s_kickCount++;
-            recordEv(2, 0);
-            Serial.printf("[net] still disconnected -- forcing reconnect (kick #%lu)\n",
-                          (unsigned long)s_kickCount);
-            WiFi.reconnect();
-        }
+        return;
     }
-    if (!apActive && WiFi.status() != WL_CONNECTED &&
-        now - beginMs > AP_FALLBACK_MS) {
+    if (!s_ssid.length()) return;  // unconfigured: the portal is all there is
+    if (!s_disconnectedSinceMs) s_disconnectedSinceMs = now ? now : 1;
+    const uint32_t down = now - s_disconnectedSinceMs;
+    // RECONNECT KICK (1.7.0): setAutoReconnect(true) is trusted to bring the
+    // station back, but it retries on its own schedule and has been observed
+    // wedged for minutes. If we have been disconnected for 15 s, force a fresh
+    // association attempt ourselves, and keep forcing one every 15 s until the
+    // link is back. Composes with the setup-AP fallback below (AP_STA keeps
+    // retrying the station side).
+    if (down > 15000 && now - s_lastKickMs > 15000) {
+        s_lastKickMs = now;
+        s_kickCount++;
+        recordEv(2, 0);
+        Serial.printf("[net] still disconnected -- forcing reconnect (kick #%lu)\n",
+                      (unsigned long)s_kickCount);
+        WiFi.reconnect();
+    }
+    // Setup-AP fallback once the station has been down AP_FALLBACK_MS in a
+    // row -- at boot (bad saved credentials) or any time later. Until 1.7.2
+    // this counted from boot instead, so after the first 30 s of uptime ANY
+    // momentary drop opened the AP at once: a switch to AP+STA mode in the
+    // middle of the station's own reconnect.
+    if (!apActive && down > AP_FALLBACK_MS) {
         Serial.println("[net] station connect timed out");
         startPortal();
     }
 }
 
 bool WifiNet::isConnected() {
-    return WiFi.status() == WL_CONNECTED;
+    return s_staUp;
+}
+
+bool WifiNet::portalActive() {
+    return apActive;
+}
+
+const char* WifiNet::hostname() {
+    return s_hostname;
 }
 
 bool WifiNet::usingStaticIp() {
@@ -278,11 +317,15 @@ void WifiNet::appendDiag(String& s) {
 }
 
 String WifiNet::eventLog() {
+    WifiEv ring[EV_RING];
+    portENTER_CRITICAL(&s_evMux);
+    memcpy(ring, s_evRing, sizeof(ring));
+    const uint32_t count = s_evCount;
+    portEXIT_CRITICAL(&s_evMux);
     String out;
-    const uint8_t n = s_evCount < EV_RING ? s_evCount : EV_RING;
-    const uint8_t first = s_evCount < EV_RING ? 0 : s_evCount % EV_RING;
-    for (uint8_t i = 0; i < n; i++) {
-        const WifiEv& e = s_evRing[(first + i) % EV_RING];
+    const uint32_t n = count < EV_RING ? count : EV_RING;
+    for (uint32_t i = 0; i < n; i++) {
+        const WifiEv& e = ring[(count - n + i) % EV_RING];
         out += String(e.up_s) + "s ";
         if (e.kind == 1) {
             out += "connected";

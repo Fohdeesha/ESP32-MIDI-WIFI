@@ -62,7 +62,11 @@ usb_transfer_t* s_txXfer = nullptr;
 QueueHandle_t s_txQueue = nullptr;
 bool s_txInFlight = false;  // touched only from the client task
 uint32_t s_txDone = 0;
-uint32_t s_txDropped = 0;  // packets lost to a full TX queue (post-backpressure)
+uint32_t s_txDropped = 0;  // loop task: packets lost to a full TX queue (post-backpressure)
+// Client task: packets in transfers that failed, or stranded in the queue by a
+// detach. Separate from s_txDropped because each counter has ONE writer task --
+// two tasks read-modify-writing one counter lose increments.
+volatile uint32_t s_txLost = 0;
 volatile int s_inFlight = 0;
 // Health bookkeeping (read from the loop task by healthy()):
 // s_rxActive counts IN transfers currently submitted. A transfer that errors
@@ -95,7 +99,9 @@ volatile uint32_t s_rxMaxPkts = 0;      // most packets ever in one transfer
 volatile uint32_t s_rxGapHist[6] = {};  // <1, <2, <5, <10, <50, >=50 ms
 volatile uint32_t s_rxErrors = 0;       // IN transfers that errored
 volatile uint32_t s_rxRecovered = 0;    // ...of those, resubmitted successfully
-volatile uint32_t s_rxRetired = 0;      // ...of those, permanently lost (depth--)
+volatile uint32_t s_rxRetired = 0;      // taken out of the active set (depth--): parked
+                                        // for recovery, or the device went away
+volatile uint32_t s_rxQueueDrops = 0;   // packets lost to a full RX queue (loop behind)
 
 // --- OUT-pipeline instrumentation ------------------------------------------
 // healthy() has always been able to say "an OUT transfer has sat unACKed for
@@ -132,6 +138,7 @@ volatile uint32_t s_txWedges = 0;       // ...of those, slower than the 2 s heal
 // read as a contradiction.
 volatile uint32_t s_txPktsWindow = 0;
 volatile uint32_t s_txDropWindow = 0;
+volatile uint32_t s_txLostWindow = 0;
 
 // Flags set in the client event callback, acted on in the client task loop
 // (descriptor walking + claiming shouldn't run inside the callback).
@@ -194,6 +201,57 @@ bool s_absentSettled = false;  // the absence has been acted on
 uint8_t s_retryStreak = 0;     // retries since the last success, for backoff
 portMUX_TYPE s_hprtMux = portMUX_INITIALIZER_UNLOCKED;
 
+// The HCD's own port-disable write (it spares the other W1C bits), done with
+// interrupts off so its ISR can't interleave on this core. Unrequested, it is
+// reported as a port error, and the hub driver recovers the port the way it
+// recovers from an unplug: anything enumerated is reported gone, and the
+// still-connected device is enumerated again from scratch.
+void injectPortError() {
+    portENTER_CRITICAL(&s_hprtMux);
+    usb_dwc_ll_hprt_port_dis(&USB_DWC);
+    portEXIT_CRITICAL(&s_hprtMux);
+}
+
+// --- Endpoint error recovery (1.7.2) ---------------------------------------
+// In IDF 4.4 a transfer error HALTS its pipe (hcd_dwc.c sets
+// HCD_PIPE_STATE_HALTED on any channel error), every other transfer pending on
+// it comes back CANCELED, and each later submit is refused with
+// ESP_ERR_INVALID_STATE until the client calls usb_host_endpoint_clear().
+// Nothing did before 1.7.2, so the resubmit-on-error 1.5.3 added could never
+// succeed: one transient error left the IN side deaf until a replug, and on
+// the OUT side every later packet was dequeued, refused and lost without even
+// counting as a drop. Now a transfer that comes back unsuccessful is parked;
+// the client pass clears the pipe and resubmits it. What a host-side clear
+// cannot lift -- a device that keeps STALLing -- and an OUT transfer the device
+// has not accepted for TX_WEDGE_RESET_MS escalate to a port reset
+// (injectPortError), i.e. the stack's unplug path and a fresh enumeration.
+constexpr uint32_t EP_RETRY_GAP_MS = 20;        // a parked pipe is retried at most this often
+constexpr uint8_t EP_ERRORS_TO_RESET = 4;       // errors within EP_ERROR_WINDOW_MS that
+constexpr uint32_t EP_ERROR_WINDOW_MS = 2000;   //   mean clearing is not helping
+constexpr uint32_t TX_STUCK_MS = 100;           // unaccepted this long: stop waiting on the queue
+constexpr uint32_t TX_WEDGE_RESET_MS = 10000;   // unaccepted this long: reset the port
+constexpr uint32_t RESET_GAP_MIN_MS = 10000;    // successive resets back off from 10 s
+constexpr uint32_t RESET_GAP_MAX_MS = 300000;   //   to 5 min for a device that never settles
+constexpr uint32_t RESET_CALM_MS = 60000;       // this long without trouble forgives the backoff
+constexpr uint32_t RESET_GONE_TIMEOUT_MS = 5000;  // a reset that never produced DEV_GONE
+
+// Client task only:
+bool s_rxParked[NUM_RX_TRANSFERS] = {};  // returned unsuccessful, awaiting resubmit
+uint32_t s_rxRetryMs = 0;
+uint16_t s_txHeld = 0;          // bytes in s_txXfer a refused submit left for next time
+uint32_t s_txRetryMs = 0;
+uint32_t s_epErrWindowMs = 0;   // start of the current error window
+uint8_t s_epErrCount = 0;
+bool s_resetWanted = false;     // escalation requested from a transfer callback
+uint32_t s_lastTroubleMs = 0;   // last endpoint error or reset
+uint32_t s_lastResetMs = 0;
+uint8_t s_resetStreak = 0;      // resets since the last calm period
+// Read by the loop task too (healthy(), writePacket(), appendPortDiag()):
+volatile bool s_txHalted = false;     // OUT pipe errored or refused: needs a clear
+volatile bool s_resetPending = false; // reset injected, DEV_GONE not seen yet
+volatile uint32_t s_epClears = 0;
+volatile uint32_t s_portResets = 0;
+
 // --- USB stack error capture (1.7.1) ---------------------------------------
 // Why an enumeration failed ("HUB: Bad transfer status 3: CHECK_SHORT_DEV_DESC",
 // "HUB: Stage failed: ...") is reported only through ESP_LOGE -- i.e. only on
@@ -247,6 +305,20 @@ int logHook(const char* fmt, va_list args) {
     return s_prevVprintf ? s_prevVprintf(fmt, args) : vprintf(fmt, args);
 }
 
+// Descriptors come from the device and are untrusted. The walkers below only
+// check that each one fits inside wTotalLength; these also check that one
+// typed INTERFACE / ENDPOINT is long enough to be read as that struct. Before
+// 1.7.2 a short endpoint descriptor was read -- and clampFullSpeedMps()
+// WRITTEN -- past its end: into the next descriptor's bLength (which then
+// hung the IDF's own descriptor walk inside interface_claim, freezing the
+// client task) or into the heap block's poison canary.
+bool isIfaceDesc(const uint8_t* p) {
+    return p[1] == USB_B_DESCRIPTOR_TYPE_INTERFACE && p[0] >= sizeof(usb_intf_desc_t);
+}
+bool isEpDesc(const uint8_t* p) {
+    return p[1] == USB_B_DESCRIPTOR_TYPE_ENDPOINT && p[0] >= sizeof(usb_ep_desc_t);
+}
+
 void dumpDescriptors(const usb_config_desc_t* cfg) {
     s_descDump[0] = '\0';
     if (!cfg) return;
@@ -255,13 +327,15 @@ void dumpDescriptors(const usb_config_desc_t* cfg) {
     const uint8_t* end = p + cfg->wTotalLength;
     while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end && off < sizeof(s_descDump) - 64) {
         uint8_t len = p[0], type = p[1];
-        if (type == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+        // Parsed only when long enough to BE what it claims (see isIfaceDesc);
+        // a short one falls through to the raw hex below.
+        if (isIfaceDesc(p)) {
             const usb_intf_desc_t* id = (const usb_intf_desc_t*)p;
             off += snprintf(s_descDump + off, sizeof(s_descDump) - off,
                             "if %u alt %u class %02x/%02x proto %02x eps %u\n",
                             id->bInterfaceNumber, id->bAlternateSetting, id->bInterfaceClass,
                             id->bInterfaceSubClass, id->bInterfaceProtocol, id->bNumEndpoints);
-        } else if (type == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+        } else if (isEpDesc(p)) {
             const usb_ep_desc_t* ed = (const usb_ep_desc_t*)p;
             off += snprintf(s_descDump + off, sizeof(s_descDump) - off,
                             "  ep %02x attr %02x mps %u interval %u\n", ed->bEndpointAddress,
@@ -280,7 +354,7 @@ void dumpDescriptors(const usb_config_desc_t* cfg) {
 
 void utf16ToAscii(const usb_str_desc_t* sd, char* out, size_t outLen) {
     size_t n = 0;
-    if (sd) {
+    if (sd && sd->bLength >= 2) {  // shorter would make the count below huge
         size_t chars = (sd->bLength - 2) / 2;
         for (size_t i = 0; i < chars && n < outLen - 1; i++) {
             uint16_t c = sd->wData[i];
@@ -297,11 +371,32 @@ int rxSlot(const usb_transfer_t* xfer) {
     return -1;
 }
 
+// Counts an endpoint error toward escalation: EP_ERRORS_TO_RESET of them inside
+// EP_ERROR_WINDOW_MS mean clearing is not helping (a STALLed endpoint fails
+// again the moment it is resubmitted). The client pass acts on the request.
+void noteEpError() {
+    const uint32_t now = millis();
+    s_lastTroubleMs = now;
+    if (!s_epErrCount || now - s_epErrWindowMs > EP_ERROR_WINDOW_MS) {
+        s_epErrWindowMs = now;
+        s_epErrCount = 0;
+    }
+    if (++s_epErrCount >= EP_ERRORS_TO_RESET) s_resetWanted = true;
+}
+
+// Real transfer errors, as opposed to the fallout of one: CANCELED is what the
+// stack returns for the siblings it flushed after an error, NO_DEVICE what it
+// returns once the device is gone.
+bool isEpError(usb_transfer_status_t st) {
+    return st != USB_TRANSFER_STATUS_COMPLETED && st != USB_TRANSFER_STATUS_CANCELED &&
+           st != USB_TRANSFER_STATUS_NO_DEVICE;
+}
+
 void onTransferDone(usb_transfer_t* xfer) {
     s_inFlight--;
     const uint32_t now_us = micros();
+    const int slot = rxSlot(xfer);
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED && s_connected) {
-        const int slot = rxSlot(xfer);
         // dwell: how long this transfer sat pending before the device filled it
         if (slot >= 0 && s_rxSubmitUs[slot]) {
             const uint32_t dwell = now_us - s_rxSubmitUs[slot];
@@ -327,7 +422,9 @@ void onTransferDone(usb_transfer_t* xfer) {
             if ((p[0] & 0x0F) == 0) continue;  // CIN 0 = reserved/padding
             MidiPacket pkt;
             memcpy(pkt.b, p, 4);
-            xQueueSend(s_queue, &pkt, 0);  // full queue: drop, never block
+            // Full queue: drop, never block -- but count it, or a stalled loop
+            // silently tearing a SysEx apart could never be seen.
+            if (xQueueSend(s_queue, &pkt, 0) != pdTRUE) s_rxQueueDrops++;
         }
         if (usb_host_transfer_submit(xfer) == ESP_OK) {
             const uint32_t sub_us = micros();
@@ -338,47 +435,81 @@ void onTransferDone(usb_transfer_t* xfer) {
             s_inFlight++;
             return;
         }
+        // Refused: a sibling's error has halted the pipe. Park it with them.
+    } else {
+        s_rxErrors++;
+        if (isEpError(xfer->status)) noteEpError();
     }
-    // Error status or a failed resubmit. Pre-1.5.3 this ALWAYS retired the
-    // transfer ("cleanup or the next device claim will resubmit"), so a single
-    // transient stall permanently shrank the IN pipeline 2 -> 1 -> 0 and it
-    // could only recover by replug or reboot -- a slow one-way decay into a
-    // device that is polled less and less often, which is what accumulating
-    // MIDI IN (and eventually a deaf device) looks like from outside.
-    // A live device gets its transfer resubmitted instead; only a genuinely
-    // gone device, or a resubmit that also fails, retires the slot.
-    s_rxErrors++;
-    if (s_connected && xfer->status != USB_TRANSFER_STATUS_NO_DEVICE &&
-        usb_host_transfer_submit(xfer) == ESP_OK) {
-        const int slot = rxSlot(xfer);
-        if (slot >= 0) s_rxSubmitUs[slot] = micros();
-        s_rxRecovered++;
-        s_inFlight++;
-        return;
-    }
-    // COUNT it out of the active RX set so healthy() can see a deaf-but-
-    // attached pipeline (pre-1.2.0 this state was silent forever).
+    // Out of the active set -- healthy() sees the pipeline shrink -- until the
+    // client pass has cleared the pipe and resubmitted it (recoverRx), or
+    // detach frees it. A gone device is never resubmitted to.
     s_rxRetired++;
     if (s_rxActive > 0) s_rxActive--;
+    if (slot >= 0 && s_connected && xfer->status != USB_TRANSFER_STATUS_NO_DEVICE) {
+        s_rxParked[slot] = true;
+    }
+}
+
+// How often a parked pipe is retried: quickly, unless clearing has already
+// been judged hopeless and a port reset is only waiting out its backoff.
+uint32_t epRetryGapMs() {
+    return s_resetWanted ? 1000 : EP_RETRY_GAP_MS;
+}
+
+// Resubmits parked IN transfers once their pipe takes them again. Clearing a
+// pipe that is not halted just returns ESP_ERR_INVALID_STATE, so this does not
+// need to know which of the two it is facing.
+void recoverRx(uint32_t now) {
+    bool any = false;
+    for (bool p : s_rxParked) any |= p;
+    if (!any || !s_connected || now - s_rxRetryMs < epRetryGapMs()) return;
+    s_rxRetryMs = now;
+    if (usb_host_endpoint_clear(s_device, s_epIn) == ESP_OK) s_epClears++;
+    for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
+        if (!s_rxParked[i] || !s_xfers[i]) continue;
+        if (usb_host_transfer_submit(s_xfers[i]) != ESP_OK) break;  // still refused
+        s_rxParked[i] = false;
+        s_rxSubmitUs[i] = micros();
+        s_inFlight++;
+        s_rxActive++;
+        s_rxRecovered++;
+    }
 }
 
 // TX runs entirely in the client task (its loop and transfer callbacks), so
 // none of it needs locking; writers only touch the TX queue + unblock.
 void serviceTx() {
     if (!s_connected || !s_txXfer || s_txInFlight) return;
-    int n = 0;
-    while (n + 4 <= s_epOutMps &&
-           xQueueReceive(s_txQueue, s_txXfer->data_buffer + n, 0) == pdTRUE) {
-        n += 4;
+    if (s_txHalted) {
+        // At most every EP_RETRY_GAP_MS, so a pipe that stays unusable (a
+        // device going away) costs a retry per gap, not a busy loop.
+        const uint32_t now = millis();
+        if (now - s_txRetryMs < epRetryGapMs()) return;
+        s_txRetryMs = now;
+        if (usb_host_endpoint_clear(s_device, s_epOut) == ESP_OK) s_epClears++;
+        s_txHalted = false;  // the submit below says whether that was enough
     }
-    if (n == 0) return;
+    // A submit the pipe refused keeps its packets, in order, for next time --
+    // until 1.7.2 they were already off the queue and simply vanished.
+    int n = s_txHeld;
+    if (n == 0) {
+        while (n + 4 <= s_epOutMps &&
+               xQueueReceive(s_txQueue, s_txXfer->data_buffer + n, 0) == pdTRUE) {
+            n += 4;
+        }
+        if (n == 0) return;
+    }
     s_txXfer->num_bytes = n;
     if (usb_host_transfer_submit(s_txXfer) == ESP_OK) {
+        s_txHeld = 0;
         s_txInFlight = true;
         s_txSubmitMs = millis();
         s_txSubmitUs = micros();
         if ((uint32_t)(n / 4) > s_txMaxPkts) s_txMaxPkts = n / 4;
         s_inFlight++;
+    } else {
+        s_txHeld = n;
+        s_txHalted = true;  // refused: the pipe is halted (or going away)
     }
 }
 
@@ -401,8 +532,17 @@ void onTxDone(usb_transfer_t* xfer) {
         s_txDone += n;
         s_txPktsWindow += n;
         serviceTx();  // keep draining if more queued up meanwhile
-    } else {
-        s_txErrors++;
+        return;
+    }
+    // The packets of an unsuccessful transfer are gone. Count them, so that
+    // "delivered + dropped" still accounts for everything that was written.
+    const uint32_t lost = (uint32_t)xfer->num_bytes / 4;
+    s_txLost += lost;
+    s_txLostWindow += lost;
+    s_txErrors++;
+    if (xfer->status != USB_TRANSFER_STATUS_NO_DEVICE) {
+        if (isEpError(xfer->status)) noteEpError();
+        s_txHalted = true;  // an error halts the pipe; serviceTx clears it
     }
 }
 
@@ -421,9 +561,9 @@ void enumerateMidiIfaces(const usb_config_desc_t* cfg) {
         while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
             uint8_t type = p[1];
             if (type == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+                cur = nullptr;  // a new interface, even a malformed one, ends the last
                 const usb_intf_desc_t* id = (const usb_intf_desc_t*)p;
-                cur = nullptr;
-                if (id->bInterfaceClass == USB_CLASS_AUDIO_ &&
+                if (isIfaceDesc(p) && id->bInterfaceClass == USB_CLASS_AUDIO_ &&
                     id->bInterfaceSubClass == USB_SUBCLASS_MIDI_STREAMING &&
                     count < MAX_MIDI_IFACES) {
                     cur = &s_ifaceList[count++];
@@ -431,12 +571,18 @@ void enumerateMidiIfaces(const usb_config_desc_t* cfg) {
                     cur->num = id->bInterfaceNumber;
                     cur->alt = id->bAlternateSetting;
                 }
-            } else if (type == USB_B_DESCRIPTOR_TYPE_ENDPOINT && cur) {
+            } else if (isEpDesc(p) && cur) {
                 const usb_ep_desc_t* ed = (const usb_ep_desc_t*)p;
                 uint8_t xt = ed->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK;
+                // A max packet size of 0 is unusable, and worse: the IDF divides
+                // an IN transfer's length by it on submit, a divide-by-zero
+                // panic on every boot with such a device attached.
+                const bool usable = (ed->wMaxPacketSize & 0x7FF) != 0;
                 if (xt == USB_BM_ATTRIBUTES_XFER_BULK || xt == USB_BM_ATTRIBUTES_XFER_INT) {
                     lastEpWasIn = (ed->bEndpointAddress & 0x80) != 0;
-                    if (lastEpWasIn && cur->epIn == 0) {
+                    if (!usable) {
+                        // recorded as absent; its cable count below is moot
+                    } else if (lastEpWasIn && cur->epIn == 0) {
                         cur->epIn = ed->bEndpointAddress;
                         cur->epInMps = ed->wMaxPacketSize;
                     } else if (!lastEpWasIn && cur->epOut == 0) {
@@ -530,6 +676,42 @@ bool prepareIface(int idx) {
     return s_epIn != 0 || s_epOut != 0;
 }
 
+// Empties the device-bound queue, counting what it held -- and the packets a
+// refused transfer was holding -- as lost: "delivered + dropped" has to account
+// for every packet written, including those a detach strands.
+void discardTxQueue() {
+    uint32_t n = s_txHeld / 4;
+    if (s_txQueue) {
+        n += uxQueueMessagesWaiting(s_txQueue);
+        xQueueReset(s_txQueue);
+    }
+    s_txHeld = 0;
+    s_txLost += n;
+    s_txLostWindow += n;
+}
+
+// Frees what prepareIface() allocated and forgets the transfer state. Every
+// transfer must be out of flight: detach drains them first, and a failed
+// attach never submitted any. Until 1.7.2 the failed-attach paths skipped
+// this, and the next attach REUSED the old transfers with their old buffer
+// size -- serviceTx() packs up to the new device's OUT MPS into that buffer, a
+// heap overflow for a second device with a bigger MPS than the first.
+void freeTransfers() {
+    for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
+        if (s_xfers[i]) {
+            usb_host_transfer_free(s_xfers[i]);
+            s_xfers[i] = nullptr;
+        }
+        s_rxParked[i] = false;
+    }
+    if (s_txXfer) {
+        usb_host_transfer_free(s_txXfer);
+        s_txXfer = nullptr;
+    }
+    s_txHeld = 0;
+    s_txHalted = false;
+}
+
 // The P1-M reports its high-speed bulk MPS (512) even when enumerated at
 // full speed (non-compliant; a FS device must report <= 64). The S3 host is
 // FS-only, so pipe allocation rejects the claim with ESP_ERR_NOT_SUPPORTED.
@@ -540,7 +722,7 @@ void clampFullSpeedMps(const usb_config_desc_t* cfg) {
     const uint8_t* p = (const uint8_t*)cfg;
     const uint8_t* end = p + cfg->wTotalLength;
     while (p + 2 <= end && p[0] >= 2 && p + p[0] <= end) {
-        if (p[1] == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+        if (isEpDesc(p)) {  // never write past a short descriptor
             usb_ep_desc_t* ed = (usb_ep_desc_t*)const_cast<uint8_t*>(p);
             if (ed->wMaxPacketSize > 64) {
                 Serial.printf("[usb] ep %02x: clamping bogus MPS %u -> 64\n",
@@ -582,11 +764,23 @@ void attachDevice(uint8_t addr) {
         usb_host_device_close(s_client, s_device);
         s_device = nullptr;
         s_productName[0] = '\0';
+        freeTransfers();
         return;
     }
     esp_err_t cerr = usb_host_interface_claim(s_client, s_device, s_ifaceNum, s_ifaceAlt);
     if (cerr != ESP_OK && s_ifaceAlt != 0) {
-        cerr = usb_host_interface_claim(s_client, s_device, s_ifaceNum, 0);
+        // Fall back to alt 0 -- with alt 0's OWN endpoints. Until 1.7.2 the
+        // transfers kept pointing at alt N's, which alt 0 need not have:
+        // every submit then failed while the status line read "connected".
+        int alt0 = -1;
+        for (uint8_t i = 0; i < s_ifaceListCount; i++) {
+            if (s_ifaceList[i].num == s_ifaceNum && s_ifaceList[i].alt == 0) alt0 = i;
+        }
+        freeTransfers();
+        if (alt0 >= 0 && prepareIface(alt0)) {
+            pick = alt0;
+            cerr = usb_host_interface_claim(s_client, s_device, s_ifaceNum, 0);
+        }
     }
     if (cerr != ESP_OK) {
         Serial.printf("[usb] interface_claim failed: %s\n", esp_err_to_name(cerr));
@@ -595,8 +789,13 @@ void attachDevice(uint8_t addr) {
         usb_host_device_close(s_client, s_device);
         s_device = nullptr;
         s_productName[0] = '\0';
+        freeTransfers();
         return;
     }
+    // A writer that was blocked on a full queue as the last device went away
+    // can slip one packet in after detach emptied it -- meant for that
+    // device, not this one.
+    discardTxQueue();
     s_connected = true;
     s_claimedIface = s_ifaceNum;
     snprintf(s_statusText, sizeof(s_statusText), "connected: \"%s\" on interface %u%s%s",
@@ -633,19 +832,22 @@ void detachDevice() {
         usb_host_device_close(s_client, s_device);
         s_device = nullptr;
     }
-    for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
-        if (s_xfers[i]) {
-            usb_host_transfer_free(s_xfers[i]);
-            s_xfers[i] = nullptr;
-        }
-    }
-    if (s_txXfer) {
-        usb_host_transfer_free(s_txXfer);
+    if (s_inFlight > 0) {
+        // Never seen: a gone device's transfers all come back NO_DEVICE within
+        // the drain. Should the stack still hold one, freeing it would be a
+        // use-after-free when it completes -- leak the lot instead.
+        Serial.printf("[usb] %d transfer(s) still in flight at detach -- not freed\n",
+                      (int)s_inFlight);
+        for (auto& x : s_xfers) x = nullptr;
         s_txXfer = nullptr;
     }
+    discardTxQueue();  // before freeTransfers(): it counts the held packets
+    freeTransfers();
+    s_resetPending = false;  // the reset (if it was one) has done its job
+    s_resetWanted = false;
+    s_epErrCount = 0;
     s_txInFlight = false;
     s_txSubmitMs = 0;
-    if (s_txQueue) xQueueReset(s_txQueue);
     s_inFlight = 0;
     s_rxActive = 0;
     s_epIn = 0;
@@ -728,11 +930,7 @@ void enumWatchdog() {
         return;
     }
     s_portState = PORT_UNENUMERATED;
-    // The HCD's own port-disable write (it spares the other W1C bits), done
-    // with interrupts off so its ISR can't interleave on this core.
-    portENTER_CRITICAL(&s_hprtMux);
-    usb_dwc_ll_hprt_port_dis(&USB_DWC);
-    portEXIT_CRITICAL(&s_hprtMux);
+    injectPortError();
     s_enumRetries++;
     s_lastRetryMs = now;
     if (s_retryStreak < 255) s_retryStreak++;
@@ -744,23 +942,79 @@ void enumWatchdog() {
              (unsigned long)s_enumRetries);
 }
 
-void clientTask(void*) {
-    while (true) {
-        // Finite timeout as a TX-service backstop; writePacket() also calls
-        // usb_host_client_unblock() so queued TX goes out immediately.
-        usb_host_client_handle_events(s_client, pdMS_TO_TICKS(50));
-        if (s_pendingGone) {
-            s_pendingGone = false;
-            detachDevice();
-        }
-        if (s_pendingAddr) {
-            uint8_t addr = s_pendingAddr;
-            s_pendingAddr = 0;
-            attachDevice(addr);
-        }
-        serviceTx();
-        enumWatchdog();
+// Client pass: turns an escalation -- endpoint errors that clearing does not
+// cure, or an OUT transfer the device has not accepted for TX_WEDGE_RESET_MS --
+// into a port reset, backing off 10 s, 20 s, ... up to 5 min between resets so
+// a device that never recovers is not reset continuously. `now` must be read
+// AFTER serviceTx(), which stamps s_txSubmitMs.
+void escalate(uint32_t now) {
+    if (s_resetPending) {
+        // DEV_GONE normally follows within milliseconds, and detach clears
+        // this. One that never came must not block every later escalation.
+        if (now - s_lastResetMs > RESET_GONE_TIMEOUT_MS) s_resetPending = false;
+        return;
     }
+    if (!s_connected) return;
+    const char* why = nullptr;
+    const uint32_t sub = s_txSubmitMs;
+    if (s_resetWanted) {
+        why = "USB errors persist";
+    } else if (sub && (int32_t)(now - sub) > (int32_t)TX_WEDGE_RESET_MS) {
+        // Signed: a submit stamped after `now` was read is 0 ms old, not
+        // 4.3e9 -- read unsigned, that difference reset a healthy device's
+        // port whenever the millisecond ticked over mid-pass.
+        why = "device stopped accepting MIDI";
+    }
+    if (!why) {
+        // The backoff is forgiven only after RESET_CALM_MS with no trouble at
+        // all. Counting from the last reset instead forgave a wedge that simply
+        // persisted through the wait, capping the backoff near 60 s.
+        if (s_resetStreak && now - s_lastTroubleMs > RESET_CALM_MS) s_resetStreak = 0;
+        return;
+    }
+    s_lastTroubleMs = now;
+    if (s_resetStreak) {
+        const uint8_t shift = s_resetStreak - 1 < 5 ? s_resetStreak - 1 : 5;
+        uint32_t gap = RESET_GAP_MIN_MS << shift;
+        if (gap > RESET_GAP_MAX_MS) gap = RESET_GAP_MAX_MS;
+        if (now - s_lastResetMs < gap) return;
+    }
+    s_resetWanted = false;
+    s_resetPending = true;
+    s_lastResetMs = now;
+    s_lastTroubleMs = now;
+    if (s_resetStreak < 255) s_resetStreak++;
+    s_portResets++;
+    injectPortError();
+    Serial.printf("[usb] %s -- resetting the device's port (#%lu)\n", why,
+                  (unsigned long)s_portResets);
+    snprintf(s_statusText, sizeof(s_statusText), "%s -- USB port reset (#%lu)", why,
+             (unsigned long)s_portResets);
+}
+
+// One pass of the client task, separate from the loop so a host-side test can
+// step it deterministically.
+void clientPass() {
+    // Finite timeout as a TX-service backstop; writePacket() also calls
+    // usb_host_client_unblock() so queued TX goes out immediately.
+    usb_host_client_handle_events(s_client, pdMS_TO_TICKS(50));
+    if (s_pendingGone) {
+        s_pendingGone = false;
+        detachDevice();
+    }
+    if (s_pendingAddr) {
+        uint8_t addr = s_pendingAddr;
+        s_pendingAddr = 0;
+        attachDevice(addr);
+    }
+    recoverRx(millis());
+    serviceTx();
+    escalate(millis());  // after serviceTx(): see escalate()
+    enumWatchdog();
+}
+
+void clientTask(void*) {
+    while (true) clientPass();
 }
 
 void daemonTask(void*) {
@@ -903,7 +1157,13 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
     // desyncs the P1-M's display parser, and the client task drains the queue
     // continuously (a full-speed bulk transfer carries 16 packets per ms), so
     // 20 ms is enough to ride out any burst the RTP side can produce.
-    if (xQueueSend(s_txQueue, pkt, pdMS_TO_TICKS(20)) != pdTRUE) {
+    // But only while the device is taking packets at all. With the OUT side
+    // stuck -- a transfer unaccepted for TX_STUCK_MS, a halted pipe, a reset
+    // on its way -- the queue never drains and each wait would stall the main
+    // loop 20 ms per packet (blankSurface() alone writes ~270): drop at once.
+    const uint32_t sub = s_txSubmitMs;
+    const bool stuck = s_txHalted || s_resetPending || (sub && millis() - sub > TX_STUCK_MS);
+    if (xQueueSend(s_txQueue, pkt, stuck ? 0 : pdMS_TO_TICKS(20)) != pdTRUE) {
         s_txDropped++;
         s_txDropWindow++;
         return false;
@@ -926,7 +1186,7 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
 }
 
 uint32_t UsbMidi::txDropCount() {
-    return s_txDropped;
+    return s_txDropped + s_txLost;
 }
 
 uint32_t UsbMidi::txPacketCount() {
@@ -938,11 +1198,12 @@ bool UsbMidi::deviceConnected() {
 }
 
 bool UsbMidi::healthy() {
-    if (!s_connected) return false;
+    if (!s_connected || s_resetPending) return false;
     // Only meaningful when the claimed function can receive at all: an
     // OUT-only device has no IN pipeline to judge, and demanding one would
     // permanently suppress the heartbeat for it.
     if (s_epIn && s_rxActive <= 0) return false;  // IN pipeline errored idle: deaf device
+    if (s_txHalted) return false;  // OUT pipe errored; recovery not through yet
     const uint32_t sub = s_txSubmitMs;
     if (sub != 0 && millis() - sub > 2000) return false;  // OUT unACKed: wedged
     return true;
@@ -998,14 +1259,18 @@ const char* UsbMidi::descriptorDump() {
 }
 
 void UsbMidi::appendRxDiag(String& out) {
-    char buf[300];
+    char buf[360];
+    // One snapshot each: the count is volatile and an attach on the client
+    // task can zero it between a zero test and the division that trusts it.
+    const uint32_t xfers = s_rxXferCount;
+    const uint32_t full = s_rxFullXfers;
     snprintf(buf, sizeof(buf),
              "transfers=%lu full=%lu (%lu%%) maxpkts=%lu | dwell_max=%lu ms "
              "resub_max=%lu us gap_max=%lu ms | gaps <1ms:%lu <2:%lu <5:%lu "
              "<10:%lu <50:%lu >=50:%lu | err=%lu recovered=%lu retired=%lu "
-             "| depth %d/%d",
-             (unsigned long)s_rxXferCount, (unsigned long)s_rxFullXfers,
-             (unsigned long)(s_rxXferCount ? s_rxFullXfers * 100 / s_rxXferCount : 0),
+             "| depth %d/%d qdrop=%lu",
+             (unsigned long)xfers, (unsigned long)full,
+             (unsigned long)(xfers ? (uint64_t)full * 100 / xfers : 0),
              (unsigned long)s_rxMaxPkts,
              (unsigned long)(s_rxDwellMaxUs / 1000),
              (unsigned long)s_rxResubMaxUs,
@@ -1014,7 +1279,8 @@ void UsbMidi::appendRxDiag(String& out) {
              (unsigned long)s_rxGapHist[2], (unsigned long)s_rxGapHist[3],
              (unsigned long)s_rxGapHist[4], (unsigned long)s_rxGapHist[5],
              (unsigned long)s_rxErrors, (unsigned long)s_rxRecovered,
-             (unsigned long)s_rxRetired, s_rxActive, NUM_RX_TRANSFERS);
+             (unsigned long)s_rxRetired, s_rxActive, NUM_RX_TRANSFERS,
+             (unsigned long)s_rxQueueDrops);
     out += buf;
 }
 
@@ -1026,7 +1292,7 @@ void UsbMidi::appendTxDiag(String& out) {
              "lat_max=%lu ms | lat <1ms:%lu <2:%lu <5:%lu <20:%lu <100:%lu "
              ">=100:%lu | qmax=%lu/1024 stalls=%lu wedges=%lu err=%lu",
              (unsigned long)n, (unsigned long)s_txPktsWindow,
-             (unsigned long)s_txDropWindow, (unsigned long)s_txMaxPkts,
+             (unsigned long)(s_txDropWindow + s_txLostWindow), (unsigned long)s_txMaxPkts,
              (unsigned long)(n ? s_txLatSumUs / n : 0),
              (unsigned long)(s_txLatMaxUs / 1000), (unsigned long)s_txLatHist[0],
              (unsigned long)s_txLatHist[1], (unsigned long)s_txLatHist[2],
@@ -1041,12 +1307,13 @@ void UsbMidi::resetDiag() {
     s_rxDwellMaxUs = s_rxResubMaxUs = s_rxGapMaxUs = 0;
     s_rxXferCount = s_rxFullXfers = s_rxMaxPkts = 0;
     s_rxErrors = s_rxRecovered = s_rxRetired = 0;
+    s_rxQueueDrops = 0;
     for (auto& h : s_rxGapHist) h = 0;
     s_txXferCount = s_txLatMaxUs = s_txLatSumUs = 0;
     s_txQueueMax = s_txMaxPkts = 0;
     s_txErrors = s_txStalls = s_txWedges = 0;
     for (auto& h : s_txLatHist) h = 0;
-    s_txPktsWindow = s_txDropWindow = 0;
+    s_txPktsWindow = s_txDropWindow = s_txLostWindow = 0;
     // NOT reset, deliberately: s_txDone / s_txDropped and the event counts are
     // the running totals the status page presents. Zeroing them here (as this
     // did until 1.6.2) silently rewound "packets delivered" and "dropped" while
@@ -1083,12 +1350,19 @@ void UsbMidi::appendPortDiag(String& out) {
     static const char* const NAMES[] = {
         "no device detected", "device detected, not enumerated",
         "device detected, port reset failed", "enumerated, not claimed", "attached"};
-    char buf[128];
+    char buf[192];
     int n = snprintf(buf, sizeof(buf), "%s | enum_retries=%lu", NAMES[s_portState],
                      (unsigned long)s_enumRetries);
     if (s_enumRetries && n > 0 && n < (int)sizeof(buf)) {
-        snprintf(buf + n, sizeof(buf) - n, " (last %lu s ago)",
-                 (unsigned long)((millis() - s_lastRetryMs) / 1000));
+        n += snprintf(buf + n, sizeof(buf) - n, " (last %lu s ago)",
+                      (unsigned long)((millis() - s_lastRetryMs) / 1000));
+    }
+    // Endpoint recovery (1.7.2): pipe clears, and the port resets they
+    // escalated to -- otherwise visible only in a status line that the
+    // re-attach overwrites within a second.
+    if (n > 0 && n < (int)sizeof(buf)) {
+        snprintf(buf + n, sizeof(buf) - n, " ep_clears=%lu port_resets=%lu",
+                 (unsigned long)s_epClears, (unsigned long)s_portResets);
     }
     out += buf;
 }

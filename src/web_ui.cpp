@@ -18,6 +18,7 @@
 namespace {
 WebServer server(80);
 bool uploadAuthorized = false;
+bool uploadEmpty = false;  // the last upload carried no file at all
 
 // "" = protection off. Basic auth, fixed username "admin". LAN-grade only.
 bool authOk() {
@@ -363,10 +364,14 @@ void handleRoot() {
     page += F("<label>WiFi password <small>(leave blank to keep current)</small></label>"
               "<input type='password' name='pass' value=''>"
               "<label>RTP-MIDI session name</label><input type='text' name='name' maxlength='24' value='");
-    page += c.sessionName;
+    // Escaped like every other stored value (1.7.2): raw, a name with an
+    // apostrophe closed the attribute early -- the form showed it cut short,
+    // and the next save stored the cut -- and markup in either field ran as
+    // script on every page load.
+    page += htmlEscape(c.sessionName);
     page += F("'><label>Connect to peer (IP, blank = accept incoming only)</label>"
               "<input type='text' name='tip' value='");
-    page += c.targetIp;
+    page += htmlEscape(c.targetIp);
     page += F("'><label>Peer port</label><input type='number' name='tport' min='1' max='65535' value='");
     page += String(c.targetPort);
     page += F("'>"
@@ -485,13 +490,105 @@ bool allDigits(const String& s) {
     return true;
 }
 
+uint32_t ipv4Value(const String& s) {
+    IPAddress a;
+    a.fromString(s);
+    return (uint32_t)a[0] << 24 | (uint32_t)a[1] << 16 | (uint32_t)a[2] << 8 | a[3];
+}
+
+// A subnet mask is a run of ones followed only by zeros (255.0.255.0 is not
+// one, and lwIP would route by it anyway), and leaves room for at least two
+// hosts: under /31 or /32 nothing -- not even a gateway -- is on-link, so the
+// device would join WiFi (no setup-AP fallback) and be unreachable.
+bool validMask(const String& s) {
+    const uint32_t m = ipv4Value(s);
+    return m != 0 && (~m & (~m + 1)) == 0 && ~m >= 3;
+}
+
+// An address a host can actually use inside its subnet: not the subnet's own
+// network or broadcast address, and not 0/8, loopback or multicast/reserved.
+bool validHostAddr(uint32_t ip, uint32_t mask) {
+    const uint32_t host = ip & ~mask;
+    const uint8_t first = ip >> 24;
+    return host != 0 && host != ~mask && first != 0 && first != 127 && first < 224;
+}
+
+// Refuses a state-changing POST that a page on ANOTHER origin made the
+// browser send (1.7.2). Basic auth alone cannot stop that: the browser
+// attaches cached credentials to any site's form POST, so any web page the
+// user visits could reset, reflash or reconfigure the bridge. Browsers
+// mark such requests with an Origin header naming the other site; this
+// page's own forms send an Origin that matches the Host they were loaded
+// from, and curl (the documented OTA route) sends none at all.
+bool sameOrigin() {
+    if (!server.hasHeader("Origin")) return true;
+    String origin = server.header("Origin");
+    const int scheme = origin.indexOf("://");
+    if (scheme < 0) return false;  // includes "null" (sandboxed/file pages)
+    origin = origin.substring(scheme + 3);
+    return origin.equalsIgnoreCase(server.hostHeader());
+}
+
+// The names this device is actually reached by: an IP literal, or its own mDNS
+// name. DNS rebinding points an attacker's domain at the device instead --
+// the attacker's page and the request then share that origin, so the Origin
+// check above passes, and with the documented default password (or none) the
+// page could reflash the bridge. Its Host header still names the attacker's
+// domain, which is refused here.
+bool hostOk() {
+    String host = server.hostHeader();
+    if (host.length() && host[0] == '[') return true;  // IPv6 literal
+    const int colon = host.indexOf(':');
+    if (colon >= 0) host = host.substring(0, colon);
+    if (host.endsWith(".")) host = host.substring(0, host.length() - 1);
+    if (validIpv4(host)) return true;
+    const String name = WifiNet::hostname();
+    return host.equalsIgnoreCase(name) || host.equalsIgnoreCase(name + ".local");
+}
+
+bool refuseCrossOrigin() {
+    if (!sameOrigin()) {
+        server.send(403, "text/plain", "Refused: request came from another site.");
+        return true;
+    }
+    if (!hostOk()) {
+        server.send(403, "text/plain",
+                    String("Refused: to change settings, open this page as http://") +
+                        WifiNet::hostname() + ".local/ or by the device's IP address.");
+        return true;
+    }
+    return false;
+}
+
 void handleConfigPost() {
     if (!authOk()) return server.requestAuthentication();
+    if (refuseCrossOrigin()) return;
     Config::Values v = Config::get();
-    if (server.hasArg("ssid") && server.arg("ssid").length()) v.wifiSsid = server.arg("ssid");
-    if (server.hasArg("pass") && server.arg("pass").length()) v.wifiPass = server.arg("pass");
-    if (server.hasArg("name") && server.arg("name").length()) v.sessionName = server.arg("name");
-    if (server.hasArg("tip")) v.targetIp = server.arg("tip");
+    // Lengths are enforced here, not just by the form's maxlength (1.7.2):
+    // a crafted POST could store anything, and a web password of 250+ chars
+    // overflows the Arduino core's own Basic-auth buffer (its length is kept
+    // in a char, which is unsigned 8-bit on this chip) on every request after.
+    const char* bad = nullptr;
+    const String ssid = server.arg("ssid");
+    const String pass = server.arg("pass");
+    const String name = server.arg("name");
+    String tip = server.arg("tip");
+    tip.trim();
+    const String webpass = server.arg("webpass");
+    if (ssid.length() > 32) bad = "WiFi SSID (at most 32 bytes)";
+    else if (pass.length() && (pass.length() < 8 || pass.length() > 64))
+        bad = "WiFi password (8 to 64 characters)";
+    else if (name.length() > 24) bad = "session name (at most 24 characters)";
+    else if (tip.length() && !validIpv4(tip)) bad = "peer IP";
+    else if (webpass.length() > 63) bad = "web UI password (at most 63 characters)";
+    if (bad) {
+        server.send(400, "text/html", String("Not saved: invalid ") + bad + ". Go back and correct it.");
+        return;
+    }
+    if (ssid.length()) v.wifiSsid = ssid;
+    if (pass.length()) v.wifiPass = pass;
+    if (name.length()) v.sessionName = name;
+    if (server.hasArg("tip")) v.targetIp = tip;
     if (server.hasArg("tport")) {
         long p = server.arg("tport").toInt();
         if (p >= 1 && p <= 65535) v.targetPort = (uint16_t)p;
@@ -538,9 +635,21 @@ void handleConfigPost() {
         sip.trim(); smask.trim(); sgw.trim(); sdns.trim();
         if (smask.length() == 0) smask = "255.255.255.0";
         if (sip.length() && (!validIpv4(sip) || sip == "0.0.0.0")) err = "static IP";
-        else if (!validIpv4(smask)) err = "subnet mask";
+        else if (!validIpv4(smask) || !validMask(smask)) err = "subnet mask";
         else if (sgw.length() && !validIpv4(sgw)) err = "gateway";
         else if (sdns.length() && !validIpv4(sdns)) err = "DNS server";
+        // lwIP only routes through an on-link gateway: one outside the subnet
+        // leaves a device that joins WiFi (so no setup-AP fallback) but that
+        // nothing beyond its own subnet can reach.
+        else if (sip.length() && sgw.length() &&
+                 (ipv4Value(sip) & ipv4Value(smask)) != (ipv4Value(sgw) & ipv4Value(smask)))
+            err = "gateway (not inside the static IP's subnet)";
+        else if (sip.length() && !validHostAddr(ipv4Value(sip), ipv4Value(smask)))
+            err = "static IP (the subnet's network or broadcast address, or reserved)";
+        else if (sip.length() && sgw.length() &&
+                 (ipv4Value(sgw) == ipv4Value(sip) ||
+                  !validHostAddr(ipv4Value(sgw), ipv4Value(smask))))
+            err = "gateway (the static IP itself, or not a usable address)";
         if (err.length()) {
             server.send(400, "text/html",
                         "Not saved: invalid " + err + ". Go back and correct it.");
@@ -557,7 +666,7 @@ void handleConfigPost() {
         // Comes from a <select>, so anything outside the fixed choice list is
         // a crafted POST -- reject rather than hand the radio a raw register
         // value.
-        if (!allDigits(a) || !Config::txPowerValid((uint8_t)n)) {
+        if (!allDigits(a) || n > 255 || !Config::txPowerValid((uint8_t)n)) {
             server.send(400, "text/html", "Not saved: invalid WiFi TX power.");
             return;
         }
@@ -581,10 +690,18 @@ void handleConfigPost() {
 
 void handleUpdatePost() {
     if (!authOk()) return server.requestAuthentication();
+    if (refuseCrossOrigin()) return;
     if (!uploadAuthorized) {
         server.send(401, "text/plain", "unauthorized");
         return;
     }
+    if (uploadEmpty) {
+        server.send(400, "text/html", "Update failed: no firmware file was selected.");
+        return;
+    }
+    // A truncated or corrupt image cannot get past this: Update.end() only
+    // activates the slot through esp_ota_set_boot_partition(), which verifies
+    // the whole image (checksum + SHA-256) first.
     bool ok = !Update.hasError();
     server.send(ok ? 200 : 500, "text/html",
                 ok ? "<meta http-equiv='refresh' content='12;url=/'>Flashed. Rebooting..."
@@ -601,18 +718,33 @@ void handleUpdateUpload() {
     if (up.status == UPLOAD_FILE_START) {
         // Gate the flash write itself, not just the completion response --
         // otherwise an unauthenticated POST would still reach the OTA slot.
-        uploadAuthorized = authOk();
+        uploadAuthorized = authOk() && sameOrigin();
+        uploadEmpty = false;
         if (!uploadAuthorized) {
             Serial.println("[web] unauthorized firmware upload rejected");
             return;
         }
         Serial.printf("[web] firmware upload start: %s\n", up.filename.c_str());
-        Update.begin(UPDATE_SIZE_UNKNOWN);
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            Serial.printf("[web] OTA begin failed: %s\n", Update.errorString());
+        }
     } else if (up.status == UPLOAD_FILE_WRITE) {
+        // The whole upload arrives inside ONE loop() pass: keep the loop
+        // watchdog (BootGuard) fed, whoever is sending.
+        BootGuard::feedWatchdog();
         if (!uploadAuthorized) return;
         Update.write(up.buf, up.currentSize);
     } else if (up.status == UPLOAD_FILE_END) {
         if (!uploadAuthorized) return;
+        // "Upload & flash" with no file chosen still posts an (empty) file
+        // part. Don't let Update.end() go looking for an image in a slot
+        // nothing was written to.
+        if (up.totalSize == 0) {
+            uploadEmpty = true;
+            Update.abort();
+            Serial.println("[web] firmware upload was empty -- nothing flashed");
+            return;
+        }
         if (Update.end(true)) {
             Serial.printf("[web] firmware upload done: %u bytes\n", up.totalSize);
         } else {
@@ -629,6 +761,7 @@ void handleUpdateUpload() {
 // rollback threshold.
 void handleRebootPost() {
     if (!authOk()) return server.requestAuthentication();
+    if (refuseCrossOrigin()) return;
     Serial.println("[web] reboot requested");
     server.send(200, "text/html",
                 "<meta http-equiv='refresh' content='10;url=/'>Rebooting...");
@@ -684,13 +817,14 @@ void handleDiag() {
 // that unlikely rather than impossible, and the correct method costs nothing.
 void handleDiagReset() {
     if (!authOk()) return server.requestAuthentication();
+    if (refuseCrossOrigin()) return;
     UsbMidi::resetDiag();
     server.send(200, "text/plain", "ok\n");
 }
-}  // namespace
 
 void handleResetPost() {
     if (!authOk()) return server.requestAuthentication();
+    if (refuseCrossOrigin()) return;
     Serial.println("[web] factory reset requested");
     server.send(200, "text/html",
                 "<meta http-equiv='refresh' content='10;url=/'>Settings erased. Rebooting...");
@@ -698,8 +832,12 @@ void handleResetPost() {
     delay(300);
     ESP.restart();
 }
+}  // namespace
 
 void WebUi::begin() {
+    // Authorization is always collected; Origin is what sameOrigin() checks.
+    static const char* HEADERS[] = {"Origin"};
+    server.collectHeaders(HEADERS, 1);
     server.on("/", HTTP_GET, handleRoot);
     server.on("/config", HTTP_POST, handleConfigPost);
     server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
