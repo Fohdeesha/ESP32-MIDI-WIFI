@@ -99,7 +99,7 @@ jobs:
           fi
 
       - name: Compose release notes
-        if: github.event_name != 'pull_request' && steps.released.outputs.exists == 'false'
+        if: github.event_name != 'pull_request' && (steps.released.outputs.exists == 'false' || github.event_name == 'workflow_dispatch')
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -116,13 +116,24 @@ jobs:
           entry = ""
           if section:
               body = section.group(1)
-              # The bullets read "- 1.2.0 <em dash> summary...", possibly wrapped.
+              # The bullets read "- 1.2.0 <em dash> summary...", possibly wrapped,
+              # optionally followed by indented "- " sub-bullets.
               pattern = r"^- " + re.escape(version) + " " + chr(8212) + " " + r"(.*?)(?=^- \d|\Z)"
               m = re.search(pattern, body, re.M | re.S)
               if m:
-                  # Un-wrap the bullet's continuation lines into a paragraph.
-                  entry = " ".join(line.strip() for line in m.group(1).splitlines()
-                                   if line.strip())
+                  # Un-wrap continuation lines; each sub-bullet stays a list item.
+                  parts = []
+                  for line in m.group(1).splitlines():
+                      text = line.strip()
+                      if not text:
+                          continue
+                      if text.startswith("- ") or not parts:
+                          parts.append(text)
+                      else:
+                          parts[-1] += " " + text
+                  entry = parts[0] if parts else ""
+                  if len(parts) > 1:
+                      entry += "\n\n" + "\n".join(parts[1:])
 
           print("## What's in this build" if entry else "## Release %s" % version)
           print()
@@ -163,3 +174,13 @@ jobs:
             --notes-file notes.md \
             --target "$GITHUB_SHA" \
             dist/*
+
+      # A manual run (Actions > build > Run workflow) republishes the current
+      # version's notes from its README entry, so an edited entry reaches an
+      # existing release without a new version. Assets are left alone.
+      - name: Refresh release notes
+        if: github.event_name == 'workflow_dispatch' && steps.released.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release edit "v$VERSION" --notes-file notes.md
