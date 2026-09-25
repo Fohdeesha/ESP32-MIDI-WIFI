@@ -113,6 +113,14 @@ String statusSection() {
     }
     s += "<tr><td>RTP-MIDI peers</td><td>" + peers + "</td></tr>";
     s += "<tr><td>USB MIDI</td><td>" + htmlEscape(UsbMidi::statusText()) + "</td></tr>";
+    {
+        // What is electrically on the port, whatever the stack made of it
+        // (1.7.1): separates "the device isn't there" from "the device is
+        // there but failed to enumerate", which used to read the same.
+        String p;
+        UsbMidi::appendPortDiag(p);
+        s += "<tr><td>USB port</td><td>" + htmlEscape(p) + "</td></tr>";
+    }
     s += "<tr><td>Bridged port</td><td>" + bridgedPortText() + "</td></tr>";
     s += "<tr><td>USB events</td><td>" + String(UsbMidi::eventCount()) + "</td></tr>";
     s += "<tr><td>USB &rarr; RTP</td><td>" + String(MidiBridge::forwardedCount()) +
@@ -167,6 +175,14 @@ String statusSection() {
             s += htmlEscape(ev);
             s += F("</pre></details>");
         }
+    }
+    if (UsbMidi::stackLogCount() > 0) {
+        String ev;
+        UsbMidi::appendStackLog(ev, "\n");
+        s += F("<details class='nets'><summary>USB host stack errors</summary>"
+               "<small>logged by the ESP-IDF USB driver; E (n) = n ms after boot</small><pre>");
+        s += htmlEscape(ev);
+        s += F("</pre></details>");
     }
     if (UsbMidi::descriptorDump()[0]) {
         s += F("<details class='nets'><summary>USB descriptors</summary><pre>");
@@ -629,7 +645,7 @@ void handleRebootPost() {
 void handleDiag() {
     if (!authOk()) return server.requestAuthentication();
     String s;
-    s.reserve(768);
+    s.reserve(1024);
     s += "fw=" FW_VERSION "\nuptime_s=";
     s += String(millis() / 1000);
     s += "\nrssi=";
@@ -647,6 +663,10 @@ void handleDiag() {
     s += String(MidiBridge::forwardedCount());
     s += "\nhealthy=";
     s += String(UsbMidi::healthy() ? 1 : 0);
+    s += "\nusb_port=";
+    UsbMidi::appendPortDiag(s);
+    s += " stack_errors=";
+    s += String(UsbMidi::stackLogCount());
     s += "\nwifi=";
     WifiNet::appendDiag(s);
     s += "\nheap=";

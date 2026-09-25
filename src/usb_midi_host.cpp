@@ -1,11 +1,15 @@
 #include "usb_midi_host.h"
 
 #include <Arduino.h>
+#include <cstdarg>
 #include <cstring>
 
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "hal/usb_dwc_ll.h"
+#include "soc/usb_dwc_struct.h"
 #include "usb/usb_host.h"
 
 // USB MIDI 1.0: MIDIStreaming interface is Audio class (1), subclass 3.
@@ -140,6 +144,108 @@ char s_statusText[192] = "not started";
 // Raw + parsed config descriptor of the last attached device, for the web
 // UI's debug view. Filled once per attach, before s_connected flips.
 char s_descDump[4096] = "";
+
+// --- Enumeration recovery (1.7.1) ------------------------------------------
+// ESP-IDF 4.4's hub driver makes exactly ONE enumeration attempt per
+// connection. If that attempt fails -- a device slow to answer its first
+// control transfer, a transient bus error -- it parks the root port in
+// HUB_DRIVER_STATE_ROOT_ENUM_FAILED, "waiting for that device to disconnect"
+// (components/usb/hub.c), and no client is told anything: the status line
+// just read "no device". A bus-powered device gets its disconnect the next
+// time it is replugged. A device on its own supply never disconnects by
+// itself, so the port stayed dead until the device was power-cycled by hand --
+// seen with a P1-M left switched on while the bridge lost power for hours and
+// later booted again. Desktop hosts don't show this; they retry enumeration.
+//
+// So the bridge retries. The DWC core's HPRT.PrtConnSts bit says a device is
+// electrically on the port (its D+/D- pull-up is present) whatever the
+// stack's state machine thinks, and usb_host_lib_info() says whether anything
+// got enumerated. Present-but-not-enumerated past a grace period means the
+// attempt failed -- or hangs: 4.4 has no control-transfer timeout, so a
+// device that NAKs forever stalls enumeration indefinitely. The retry is to
+// disable the port behind the stack's back: the exact register write the
+// HCD's own disable command makes, but unrequested, so the HCD reports it as
+// a port error. The hub driver's error handling -- the same path an unplug
+// takes -- then cleans up whatever the attempt left behind, recovers the port
+// and enumerates the still-connected device from scratch. Done only while
+// nothing is enumerated, so it cannot disturb a working attachment.
+constexpr uint32_t ENUM_GRACE_MS = 5000;       // a healthy attach takes < 1 s
+constexpr uint32_t ENUM_RETRY_MAX_MS = 60000;  // backoff ceiling for a hopeless device
+constexpr uint32_t ABSENT_SETTLE_MS = 2000;    // gone this long = really unplugged
+constexpr uint32_t WATCHDOG_PERIOD_MS = 200;
+
+volatile uint32_t s_enumRetries = 0;  // port-error retries since boot
+volatile uint32_t s_lastRetryMs = 0;
+// What the port looks like, cached by the client task for the web UI (the
+// register itself is only read from the USB tasks).
+enum PortState : uint8_t {
+    PORT_EMPTY,          // no pull-up on D+/D-: nothing is presenting itself
+    PORT_UNENUMERATED,   // a device is there, the stack has not enumerated it
+    PORT_RESET_FAILED,   // ...and the port never enabled, so there is no retry
+    PORT_NOT_CLAIMED,    // enumerated, but no usable MIDI interface / claim failed
+    PORT_ATTACHED,
+};
+volatile PortState s_portState = PORT_EMPTY;
+// Client task only:
+uint32_t s_wdLastMs = 0;
+uint32_t s_unenumSinceMs = 0;  // present but not enumerated since; 0 = not
+uint32_t s_absentSinceMs = 0;  // nothing on the port since; 0 = something is
+bool s_absentSettled = false;  // the absence has been acted on
+uint8_t s_retryStreak = 0;     // retries since the last success, for backoff
+portMUX_TYPE s_hprtMux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- USB stack error capture (1.7.1) ---------------------------------------
+// Why an enumeration failed ("HUB: Bad transfer status 3: CHECK_SHORT_DEV_DESC",
+// "HUB: Stage failed: ...") is reported only through ESP_LOGE -- i.e. only on
+// the UART, which is not cabled when the bridge is deployed. This core's IDF
+// libraries are built with CONFIG_LOG_MAXIMUM_LEVEL = ERROR, so these lines
+// are all the stack can say at all; a vprintf hook keeps the USB ones for the
+// status page and passes every line on to the UART unchanged.
+constexpr int STACK_LOG_RING = 8;
+char s_stackLog[STACK_LOG_RING][96];
+uint32_t s_stackLogCount = 0;
+portMUX_TYPE s_stackLogMux = portMUX_INITIALIZER_UNLOCKED;
+vprintf_like_t s_prevVprintf = nullptr;
+
+bool isUsbTag(const char* tag) {
+    // The IDF 4.4 usb component: hub.c, usbh.c, usb_host.c, hcd_dwc.c, usb_phy.c.
+    static const char* const TAGS[] = {"HUB", "USBH", "USB HOST", "HCD DWC", "usb_phy"};
+    for (const char* t : TAGS)
+        if (strcmp(tag, t) == 0) return true;
+    return false;
+}
+
+// Separate, so the line buffer costs stack only on a USB error -- the hook
+// itself runs on whichever task logged, the WiFi task included.
+__attribute__((noinline)) void keepStackLine(const char* fmt, va_list args) {
+    char line[sizeof(s_stackLog[0])];
+    vsnprintf(line, sizeof(line), fmt, args);
+    line[strcspn(line, "\r\n")] = '\0';
+    portENTER_CRITICAL(&s_stackLogMux);
+    strcpy(s_stackLog[s_stackLogCount % STACK_LOG_RING], line);
+    s_stackLogCount++;
+    portEXIT_CRITICAL(&s_stackLogMux);
+}
+
+int logHook(const char* fmt, va_list args) {
+    // ESP_LOGx formats begin "<L> (%u) %s: " -- timestamp, then tag -- so when
+    // the format says exactly that, the second argument IS the tag and is safe
+    // to peek at without formatting anything.
+    if (fmt && fmt[0] && strncmp(fmt + 1, " (%u) %s: ", 10) == 0) {
+        va_list peek;
+        va_copy(peek, args);
+        (void)va_arg(peek, unsigned);
+        const char* tag = va_arg(peek, const char*);
+        va_end(peek);
+        if (tag && isUsbTag(tag)) {
+            va_list copy;
+            va_copy(copy, args);
+            keepStackLine(fmt, copy);
+            va_end(copy);
+        }
+    }
+    return s_prevVprintf ? s_prevVprintf(fmt, args) : vprintf(fmt, args);
+}
 
 void dumpDescriptors(const usb_config_desc_t* cfg) {
     s_descDump[0] = '\0';
@@ -559,6 +665,85 @@ void onClientEvent(const usb_host_client_event_msg_t* msg, void* /*arg*/) {
     }
 }
 
+// Client task, every pass: spots a device that is on the port but never got
+// enumerated, and has the hub driver retry it (see "Enumeration recovery"),
+// backing off 5 s -> 60 s so a device that can never enumerate isn't hammered.
+void enumWatchdog() {
+    const uint32_t now = millis();
+    if (now - s_wdLastMs < WATCHDOG_PERIOD_MS) return;
+    s_wdLastMs = now;
+    if (s_device) {
+        s_portState = PORT_ATTACHED;
+        s_retryStreak = 0;
+        s_unenumSinceMs = s_absentSinceMs = 0;
+        s_absentSettled = false;
+        return;
+    }
+    usb_dwc_hprt_reg_t hprt;
+    hprt.val = USB_DWC.hprt_reg.val;
+    if (!hprt.prtconnsts) {
+        s_portState = PORT_EMPTY;
+        s_unenumSinceMs = 0;
+        if (!s_absentSinceMs) s_absentSinceMs = now ? now : 1;
+        // Gone for real, not the blip of a port recovery: the next device
+        // starts with a fresh backoff, and a "did not enumerate" or "no MIDI
+        // interface" line must not outlive the device it described.
+        if (!s_absentSettled && now - s_absentSinceMs > ABSENT_SETTLE_MS) {
+            s_absentSettled = true;
+            s_retryStreak = 0;
+            snprintf(s_statusText, sizeof(s_statusText), "host active, no device");
+        }
+        return;
+    }
+    s_absentSinceMs = 0;
+    s_absentSettled = false;
+    usb_host_lib_info_t info;
+    if (usb_host_lib_info(&info) != ESP_OK || info.num_devices > 0) {
+        // Enumerated, just not ours (no MIDI interface, claim failed). The
+        // status line already says why, and a retry would not change it.
+        s_portState = PORT_NOT_CLAIMED;
+        s_unenumSinceMs = 0;
+        return;
+    }
+    if (!s_unenumSinceMs) {
+        s_portState = PORT_UNENUMERATED;
+        s_unenumSinceMs = now ? now : 1;
+        return;
+    }
+    uint32_t wait = ENUM_GRACE_MS << (s_retryStreak < 4 ? s_retryStreak : 4);
+    if (wait > ENUM_RETRY_MAX_MS) wait = ENUM_RETRY_MAX_MS;
+    if (now - s_unenumSinceMs < wait) {
+        s_portState = PORT_UNENUMERATED;
+        return;
+    }
+    if (!hprt.prtena) {
+        // There this long and the port still isn't enabled: the hub's reset
+        // of the device failed, so there is no enabled port for an error to
+        // disable and no retry to offer from here (the stack errors say why).
+        if (s_portState != PORT_RESET_FAILED) {
+            s_portState = PORT_RESET_FAILED;
+            snprintf(s_statusText, sizeof(s_statusText),
+                     "device on the port, but its USB reset failed -- replug or power-cycle it");
+        }
+        return;
+    }
+    s_portState = PORT_UNENUMERATED;
+    // The HCD's own port-disable write (it spares the other W1C bits), done
+    // with interrupts off so its ISR can't interleave on this core.
+    portENTER_CRITICAL(&s_hprtMux);
+    usb_dwc_ll_hprt_port_dis(&USB_DWC);
+    portEXIT_CRITICAL(&s_hprtMux);
+    s_enumRetries++;
+    s_lastRetryMs = now;
+    if (s_retryStreak < 255) s_retryStreak++;
+    Serial.printf("[usb] device on the port but not enumerated for %lu ms -- retrying (#%lu)\n",
+                  (unsigned long)(now - s_unenumSinceMs), (unsigned long)s_enumRetries);
+    s_unenumSinceMs = 0;
+    snprintf(s_statusText, sizeof(s_statusText),
+             "device on the port did not enumerate -- retrying (retry %lu)",
+             (unsigned long)s_enumRetries);
+}
+
 void clientTask(void*) {
     while (true) {
         // Finite timeout as a TX-service backstop; writePacket() also calls
@@ -574,6 +759,7 @@ void clientTask(void*) {
             attachDevice(addr);
         }
         serviceTx();
+        enumWatchdog();
     }
 }
 
@@ -655,6 +841,8 @@ void UsbMidi::begin(uint8_t preferredInterface) {
     // 300+ event packets (32 display cells as chunked sysex + every LED,
     // ring, meter and fader), and dropping mid-sysex tears the frame.
     s_txQueue = xQueueCreate(1024, sizeof(MidiPacket));
+    // Before the install, so even the first enumeration's errors are kept.
+    s_prevVprintf = esp_log_set_vprintf(logHook);
 
     usb_host_config_t hostCfg = {};
     hostCfg.skip_phy_setup = false;
@@ -681,8 +869,10 @@ void UsbMidi::begin(uint8_t preferredInterface) {
     }
 
     // Above loopTask (prio 1) so MIDI IN transfers get serviced promptly,
-    // on core 1 to stay clear of the WiFi stack on core 0.
-    xTaskCreatePinnedToCore(daemonTask, "usbh_daemon", 4096, nullptr, 5, nullptr, 1);
+    // on core 1 to stay clear of the WiFi stack on core 0. The daemon gets
+    // 5 kB rather than 4: the hub driver's error logs run on it, and those
+    // are now also formatted into the status page's ring (keepStackLine).
+    xTaskCreatePinnedToCore(daemonTask, "usbh_daemon", 5120, nullptr, 5, nullptr, 1);
     xTaskCreatePinnedToCore(clientTask, "usbh_client", 4096, nullptr, 5, nullptr, 1);
     snprintf(s_statusText, sizeof(s_statusText), "host active, no device");
     Serial.println("[usb] host mode active, waiting for device on OTG port");
@@ -883,4 +1073,41 @@ void UsbMidi::appendRecentTxEvents(String& out, const char* sep) {
 
 uint32_t UsbMidi::txFormattedCount() {
     return s_txFormatted;
+}
+
+uint32_t UsbMidi::enumRetryCount() {
+    return s_enumRetries;
+}
+
+void UsbMidi::appendPortDiag(String& out) {
+    static const char* const NAMES[] = {
+        "no device detected", "device detected, not enumerated",
+        "device detected, port reset failed", "enumerated, not claimed", "attached"};
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "%s | enum_retries=%lu", NAMES[s_portState],
+                     (unsigned long)s_enumRetries);
+    if (s_enumRetries && n > 0 && n < (int)sizeof(buf)) {
+        snprintf(buf + n, sizeof(buf) - n, " (last %lu s ago)",
+                 (unsigned long)((millis() - s_lastRetryMs) / 1000));
+    }
+    out += buf;
+}
+
+uint32_t UsbMidi::stackLogCount() {
+    return s_stackLogCount;
+}
+
+void UsbMidi::appendStackLog(String& out, const char* sep) {
+    // Snapshot under the lock (the hook writes from other tasks), then build
+    // the String outside it -- no allocation inside a critical section.
+    char copy[STACK_LOG_RING][sizeof(s_stackLog[0])];
+    portENTER_CRITICAL(&s_stackLogMux);
+    const uint32_t count = s_stackLogCount;
+    memcpy(copy, s_stackLog, sizeof(copy));
+    portEXIT_CRITICAL(&s_stackLogMux);
+    const uint32_t n = count < STACK_LOG_RING ? count : STACK_LOG_RING;
+    for (uint32_t i = 0; i < n; i++) {  // oldest first
+        if (i) out += sep;
+        out += copy[(count - n + i) % STACK_LOG_RING];
+    }
 }

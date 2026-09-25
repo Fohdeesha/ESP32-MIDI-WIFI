@@ -88,6 +88,24 @@ void appendRxDiag(String& out);
 // high-water measure how close the offered rate is to what the device can
 // absorb, which healthy()'s after-the-fact 2 s wedge test cannot.
 void appendTxDiag(String& out);
+// --- Enumeration recovery (1.7.1) -------------------------------------------
+// ESP-IDF 4.4 makes one enumeration attempt per connection and then waits for
+// the device to disconnect -- which a self-powered device never does. The
+// client task retries whenever a device is electrically on the port but
+// nothing has enumerated for 5 s (backing off to once a minute), by making
+// the hub driver take its unplug-recovery path. This counts those retries.
+uint32_t enumRetryCount();
+// One line: what is physically on the port ("no device detected", "device
+// detected, not enumerated", "device detected, port reset failed",
+// "enumerated, not claimed", "attached") plus the retry count. "No device
+// detected" with a device plugged in and switched on means the device is not
+// presenting itself on the bus at all (no D+/D- pull-up: its USB side is off,
+// waiting for VBUS, or the cable is bad), which no retry on this side can fix.
+void appendPortDiag(String& out);
+// Error lines the ESP-IDF USB stack logged (normally UART-only), oldest first,
+// sep between entries -- how a failed enumeration explains itself.
+uint32_t stackLogCount();
+void appendStackLog(String& out, const char* sep);
 // Zeroes both pipelines' diagnostic counters, so a measurement run describes
 // itself instead of being averaged against everything since boot. The running
 // totals the status page presents -- packets delivered, packets dropped, and

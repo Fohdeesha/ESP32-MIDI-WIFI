@@ -8,7 +8,7 @@ wireless one. Plug a keyboard or controller into the ESP32-S3's USB OTG port
 using RTP-MIDI (AppleMIDI, RFC 6295), so it shows up in macOS, Windows
 (rtpMIDI), and Linux as a standard network MIDI session.
 
-**Current version: 1.7.0**
+**Current version: 1.7.1**
 
 ![The web UI: status and diagnostics above the configuration form](docs/status-page.png)
 
@@ -38,7 +38,9 @@ configurable per direction (default: the first port, both ways).
 
 - **USB host** for class-compliant USB MIDI devices, including workarounds for
   common descriptor quirks (e.g. devices that report a high-speed bulk packet
-  size on a full-speed link).
+  size on a full-speed link), and automatic retry of a device that fails to
+  enumerate — so a self-powered device left on while the bridge reboots is
+  picked up again without power-cycling it.
 - **Selectable MIDI port**: multi-port devices present several virtual cables
   (and occasionally several MIDI interfaces) — pick which one to bridge from
   the web UI, separately per direction if a device needs it, or merge every
@@ -57,9 +59,10 @@ configurable per direction (default: the first port, both ways).
 - **Web config UI** (`http://esp32-midi.local/`): status, WiFi and network
   settings, RTP-MIDI session settings, MIDI port selection, password
   management, reboot, factory reset, and a live diagnostics view in collapsible
-  sections (USB state, USB IN- and OUT-pipeline statistics, decoded recent MIDI
-  events in both directions with their port numbers, RTP-MIDI session event log,
-  USB descriptor dump). A plain-text `/diag` endpoint carries the same counters
+  sections (USB state, what is electrically on the USB port, USB IN- and
+  OUT-pipeline statistics, decoded recent MIDI events in both directions with
+  their port numbers, RTP-MIDI session event log, the USB driver's own error
+  log, USB descriptor dump). A plain-text `/diag` endpoint carries the same counters
   in a few hundred bytes, cheap enough to poll once a second while measuring
   throughput; `POST /diagreset` zeroes the diagnostic counters for a fresh run,
   leaving the running totals alone.
@@ -202,6 +205,25 @@ for a forgotten password or bad network config on a headless device.
 
 ## Version history
 
+- 1.7.1 — **a device that fails its first enumeration is retried instead of
+  abandoned.** ESP-IDF 4.4's USB host makes exactly one enumeration attempt per
+  connection; if it fails, the stack waits for the device to disconnect before
+  it will try again, and tells the application nothing, so the status page just
+  read "no device". A bus-powered device gets that disconnect when it is
+  replugged; a self-powered one never does. An Icon P1-M left switched on while
+  the bridge lost power for hours was never seen again once the bridge came
+  back, until the surface itself was power-cycled. The bridge now watches the
+  port directly — the USB controller's connect-status bit says whether a device
+  is electrically present, whatever the stack's state machine thinks — and when
+  one has sat there for 5 s without enumerating, it makes the stack take its
+  unplug-recovery path and enumerate the device afresh, backing off to once a
+  minute for a device that never succeeds. It never touches a device that
+  enumerated. The status page gains a **USB port** row (no device detected /
+  device detected, not enumerated / attached, with the retry count), which
+  separates "the device is not presenting itself at all" from "the device is
+  there but failed to enumerate" — they used to read the same — and a **USB host
+  stack errors** section carrying the USB driver's own error lines, which until
+  now only ever reached the UART. `/diag` gains a matching `usb_port=` line.
 - 1.7.0 — **WiFi dropouts are now self-diagnosing, and TX power is
   configurable.** A station disconnect used to change nothing but the status
   LED: no reason code, no counter, no history — so a device that fell off the
