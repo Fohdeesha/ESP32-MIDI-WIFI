@@ -39,6 +39,7 @@ void healthTick();
 // safe to send to anything.
 void blankSurface();
 uint32_t forwardedCount();  // USB -> RTP events sent to a peer
+uint32_t uplinkPackets();   // ...and the batches they went out in (~datagrams)
 uint32_t returnedCount();   // RTP -> USB events queued toward the device
 
 // RTP receive entry points, called from RtpMidi's MIDI callbacks (loop

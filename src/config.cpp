@@ -67,6 +67,9 @@ void Config::load() {
     if (values.usbCableOut > 15 && values.usbCableOut != CABLE_SAME) {
         values.usbCableOut = CABLE_SAME;
     }
+    // A power this build no longer offers (1.7.0-1.7.2 went up to 19.5 dBm)
+    // loads as the default, not the nearest choice: those versions stored
+    // 19.5 dBm whenever the config page was saved with the field untouched.
     if (!txPowerValid(values.txPower)) values.txPower = TX_POWER_DEFAULT;
 }
 

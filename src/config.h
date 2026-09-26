@@ -25,21 +25,21 @@ struct Values {
     // keeps the two directions locked together, which is what a control
     // surface needs -- it expects its LEDs back on the port it sent from.
     uint8_t usbCableOut;
-    // WiFi TX power, stored as the wifi_power_t raw value (quarter-dBm: 78 =
-    // 19.5 dBm). Configurable because the right value is a trade: more power =
-    // more uplink margin against interference, but full power has glitched the
-    // CH340 serial link at the bench (RFI/current spike with an external
-    // antenna) -- harmless deployed with nothing on the UART, annoying while
-    // flashing/monitoring. Only values in TX_POWER_CHOICES are accepted.
+    // WiFi TX power, stored as the wifi_power_t raw value (quarter-dBm: 34 =
+    // 8.5 dBm). Capped at 11 dBm since 1.7.3: on boards with a weak 3.3 V
+    // regulator the transmit current sags the rail, and above ~8.5 dBm that
+    // collapsed the link under a steady MIDI stream (and at 19.5 dBm browned
+    // out the board's USB-serial chip). Only values in TX_POWER_CHOICES are
+    // accepted.
     uint8_t txPower;
 };
 
 constexpr uint8_t IFACE_AUTO = 0xFF;
 constexpr uint8_t CABLE_ALL = 0xFF;   // input only
 constexpr uint8_t CABLE_SAME = 0xFE;  // output only: follow the input setting
-// Allowed TX power settings (wifi_power_t raw values): 19.5 / 15 / 11 / 8.5 dBm.
-constexpr uint8_t TX_POWER_CHOICES[] = {78, 60, 44, 34};
-constexpr uint8_t TX_POWER_DEFAULT = 78;  // 19.5 dBm (max)
+// Allowed TX power settings (wifi_power_t raw values): 11 / 8.5 / 7 / 5 / 2 dBm.
+constexpr uint8_t TX_POWER_CHOICES[] = {44, 34, 28, 20, 8};
+constexpr uint8_t TX_POWER_DEFAULT = 34;  // 8.5 dBm
 inline bool txPowerValid(uint8_t v) {
     for (uint8_t c : TX_POWER_CHOICES)
         if (v == c) return true;

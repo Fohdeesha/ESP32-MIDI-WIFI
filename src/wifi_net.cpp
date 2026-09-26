@@ -3,6 +3,7 @@
 #include <ESPmDNS.h>
 #include <WiFi.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
 
 namespace {
 const char* s_hostname = "esp32-midi";
@@ -45,6 +46,27 @@ int8_t s_lastRssi = 0;          // refreshed while connected (RSSI reads garbage
 uint32_t s_lastRssiMs = 0;
 uint32_t s_lastKickMs = 0;
 uint32_t s_disconnectedSinceMs = 0;  // loop task; 0 = not currently disconnected
+
+// ── Paced reconnects (1.7.3) ─────────────────────────────────────────────────
+// The core's auto-reconnect retries the instant a disconnect is reported. An
+// AP that still holds the old session (a Ruckus R750 after the board lost
+// power) accepts each attempt and drops it within milliseconds, so that loop
+// ran at up to 13 association attempts a second for 20-50 s: hundreds of
+// join/leave events per outage, which bought nothing and loaded the AP. The
+// loop task retries itself instead: 250 ms after a drop, then doubling to a
+// 4 s ceiling (15 s while the setup AP is up, since every attempt that scans
+// takes the AP off its channel). The delay resets once a link holds for 10 s.
+constexpr uint32_t RETRY_FIRST_MS = 250;
+constexpr uint32_t RETRY_MAX_MS = 4000;
+constexpr uint32_t RETRY_MAX_PORTAL_MS = 15000;
+constexpr uint32_t RETRY_RESET_MS = 10000;
+volatile uint32_t s_failEvents = 0;  // event task: disconnects that want a retry
+uint32_t s_failSeen = 0;             // loop task from here down
+uint32_t s_retryDelayMs = 0;         // 0 = the next retry is the first
+uint32_t s_retryAtMs = 0;
+bool s_retryPending = false;
+uint32_t s_retryCount = 0;
+uint32_t s_upSinceMs = 0;
 
 void recordEv(uint8_t kind, uint8_t reason) {
     const WifiEv e = {(uint32_t)(millis() / 1000), kind, reason, s_lastRssi};
@@ -116,6 +138,18 @@ void closePortal() {
     apActive = false;
 }
 
+// Loop task. Books the next connection attempt one backoff step from now.
+void scheduleRetry(uint32_t now) {
+    const uint32_t cap = apActive ? RETRY_MAX_PORTAL_MS : RETRY_MAX_MS;
+    if (!s_retryDelayMs) {
+        s_retryDelayMs = RETRY_FIRST_MS;
+    } else {
+        s_retryDelayMs = s_retryDelayMs * 2 < cap ? s_retryDelayMs * 2 : cap;
+    }
+    s_retryAtMs = now + s_retryDelayMs;
+    s_retryPending = true;
+}
+
 // Applies the configured static IP before WiFi.begin(). Any invalid value
 // falls back to DHCP (with a log) rather than bricking connectivity -- the
 // web UI validates on save, so this only triggers on hand-edited NVS.
@@ -181,6 +215,9 @@ void onWifiEvent(WiFiEvent_t event, arduino_event_info_t info) {
             s_staUp = false;
             s_discCount++;
             s_lastReason = r;
+            // ASSOC_LEAVE is this station's own disconnect (the reconnect kick,
+            // the core's one-off retry at boot), not a failure to act on.
+            if (r != WIFI_REASON_ASSOC_LEAVE) s_failEvents++;
             recordEv(0, r);
             Serial.printf("[net] station DISCONNECTED, reason %s (disconnect #%lu, last RSSI %d dBm)\n",
                           reasonText(r).c_str(), (unsigned long)s_discCount, s_lastRssi);
@@ -204,15 +241,12 @@ void WifiNet::begin(const Config::Values& cfg, const char* hostname) {
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(hostname);
     WiFi.setSleep(false);  // modem sleep adds latency spikes -- unacceptable for MIDI
-    WiFi.setAutoReconnect(true);
+    WiFi.setAutoReconnect(false);  // tick() paces the retries (1.7.3)
     WiFi.onEvent(onWifiEvent);
     staticApplied = applyStaticIp(cfg);  // must precede WiFi.begin()
-    // TX power is config-driven since 1.7.0 (default 19.5 dBm, the maximum).
-    // History: 1.5.x pinned 11 dBm because full power glitched the CH340
-    // serial link at the bench -- but that only matters with the UART cabled,
-    // and the deployed link margin turned out to need the power (RSSI at the
-    // installed position degraded from -39 to -60 dBm over time). Lower it
-    // from the web page if bench serial glitches return.
+    // TX power comes from the config: 8.5 dBm by default, 11 dBm at most
+    // (1.7.3; 1.7.0-1.7.2 defaulted to 19.5 dBm, and on a board whose supply
+    // sags under transmit current that is what broke the link -- see config.h).
     // Set BEFORE begin() (1.5.4): some IDF versions re-apply the default power
     // during association, which would silently undo a post-begin() call.
     WiFi.setTxPower((wifi_power_t)cfg.txPower);
@@ -228,11 +262,15 @@ void WifiNet::tick() {
         s_wasUp = up;
         if (up) {
             s_disconnectedSinceMs = 0;
+            s_upSinceMs = now;
+            s_retryPending = false;
             closePortal();
             startMdns();
         }
     }
     if (up) {
+        // A link that has held earns a fast first retry after its next drop.
+        if (s_retryDelayMs && now - s_upSinceMs > RETRY_RESET_MS) s_retryDelayMs = 0;
         // Keep a last-known-good RSSI for the diagnostics: once the link is
         // gone, WiFi.RSSI() no longer means anything.
         if (now - s_lastRssiMs > 2000) {
@@ -244,12 +282,22 @@ void WifiNet::tick() {
     if (!s_ssid.length()) return;  // unconfigured: the portal is all there is
     if (!s_disconnectedSinceMs) s_disconnectedSinceMs = now ? now : 1;
     const uint32_t down = now - s_disconnectedSinceMs;
-    // RECONNECT KICK (1.7.0): setAutoReconnect(true) is trusted to bring the
-    // station back, but it retries on its own schedule and has been observed
-    // wedged for minutes. If we have been disconnected for 15 s, force a fresh
-    // association attempt ourselves, and keep forcing one every 15 s until the
-    // link is back. Composes with the setup-AP fallback below (AP_STA keeps
-    // retrying the station side).
+    // Every failed attempt, the drop itself included, books the next one.
+    const uint32_t fails = s_failEvents;
+    if (fails != s_failSeen) {
+        s_failSeen = fails;
+        scheduleRetry(now);
+    }
+    if (s_retryPending && (int32_t)(now - s_retryAtMs) >= 0) {
+        s_retryPending = false;
+        s_retryCount++;
+        if (esp_wifi_connect() != ESP_OK) scheduleRetry(now);
+    }
+    // RECONNECT KICK (1.7.0): the safety net under the retries above, for an
+    // attempt that never reports back. Auto-reconnect was observed wedged for
+    // minutes, so after 15 s down a fresh association is forced, and again
+    // every 15 s until the link is back. Composes with the setup-AP fallback
+    // below (AP_STA keeps retrying the station side).
     if (down > 15000 && now - s_lastKickMs > 15000) {
         s_lastKickMs = now;
         s_kickCount++;
@@ -306,6 +354,8 @@ const char* WifiNet::resetReasonName() {
 void WifiNet::appendDiag(String& s) {
     s += "disconnects=";
     s += String(s_discCount);
+    s += " retries=";
+    s += String(s_retryCount);
     s += " kicks=";
     s += String(s_kickCount);
     s += " last_reason=";

@@ -102,6 +102,30 @@ static_assert(SYSEX_SEG + 1 + USB_BATCH * 5 + 64 <= 1400,
 
 bool s_tickPeer = false;  // RtpMidi::hasPeer() as the last tick() saw it
 
+// Uplink pacing (1.7.3). Everything queued in one loop pass leaves as one
+// datagram, and the loop runs ~480 times a second, so a busy surface (a few
+// faders moving) went out as several hundred small packets a second -- each a
+// burst of transmit current, which counts on a marginal supply. A token bucket
+// now paces the drain: after a quiet spell up to UPLINK_BURST packets leave
+// back to back, so a note, chord or button press is never held, while a
+// sustained stream gets one packet per UPLINK_TOKEN_MS carrying everything
+// queued since the last. Nothing is dropped or merged; a message waits at most
+// UPLINK_TOKEN_MS (the USB queue holds 128, far more than that fills with).
+constexpr uint32_t UPLINK_TOKEN_MS = 10;
+constexpr uint8_t UPLINK_BURST = 4;
+uint8_t s_upTokens = UPLINK_BURST;
+uint32_t s_upRefillMs = 0;
+uint32_t s_upPackets = 0;  // loop passes that forwarded anything (~datagrams)
+
+bool uplinkReady(uint32_t now) {
+    while (s_upTokens < UPLINK_BURST && now - s_upRefillMs >= UPLINK_TOKEN_MS) {
+        s_upTokens++;
+        s_upRefillMs += UPLINK_TOKEN_MS;
+    }
+    if (s_upTokens == UPLINK_BURST) s_upRefillMs = now;  // refill starts at the next spend
+    return s_upTokens > 0;
+}
+
 }  // namespace
 
 void MidiBridge::begin(uint8_t cable, uint8_t outCable) {
@@ -138,10 +162,15 @@ void MidiBridge::tick() {
         s_sysexLen = 0;
         s_sysexSegmented = false;
     }
+    // With a peer, wait for a token; without one the queue is drained and
+    // discarded straight away.
+    if (peer && !uplinkReady(millis())) return;
     uint8_t p[4];
+    bool bridged = false;
     for (int n = 0; n < USB_BATCH && UsbMidi::readPacket(p); n++) {
         if (s_cable != Config::CABLE_ALL && (p[0] >> 4) != s_cable) continue;
         if (!peer) continue;  // nobody to send to
+        bridged = true;
         uint8_t ch = (p[1] & 0x0F) + 1;
         switch (p[0] & 0x0F) {
             case 0x8:
@@ -207,10 +236,18 @@ void MidiBridge::tick() {
                 break;
         }
     }
+    if (bridged) {
+        s_upTokens--;
+        s_upPackets++;
+    }
 }
 
 uint32_t MidiBridge::forwardedCount() {
     return s_forwarded;
+}
+
+uint32_t MidiBridge::uplinkPackets() {
+    return s_upPackets;
 }
 
 // ---- RTP -> USB (0.7.0) ----------------------------------------------------

@@ -108,32 +108,13 @@ jobs:
 
           sys.stdout.reconfigure(encoding="utf-8")
           version = os.environ["VERSION"]
-          readme = open("README.md", encoding="utf-8").read()
+          changelog = open("CHANGELOG.md", encoding="utf-8").read()
 
-          # Pull this version's bullet out of the README's "Version history" section.
-          section = re.search(r"^## Version history\s*$(.*?)(?=^## |\Z)",
-                              readme, re.M | re.S)
-          entry = ""
-          if section:
-              body = section.group(1)
-              # The bullets read "- 1.2.0 <em dash> summary...", possibly wrapped,
-              # optionally followed by indented "- " sub-bullets.
-              pattern = r"^- " + re.escape(version) + " " + chr(8212) + " " + r"(.*?)(?=^- \d|\Z)"
-              m = re.search(pattern, body, re.M | re.S)
-              if m:
-                  # Un-wrap continuation lines; each sub-bullet stays a list item.
-                  parts = []
-                  for line in m.group(1).splitlines():
-                      text = line.strip()
-                      if not text:
-                          continue
-                      if text.startswith("- ") or not parts:
-                          parts.append(text)
-                      else:
-                          parts[-1] += " " + text
-                  entry = parts[0] if parts else ""
-                  if len(parts) > 1:
-                      entry += "\n\n" + "\n".join(parts[1:])
+          # This version's section: everything under "## <version>" up to the
+          # next heading.
+          m = re.search(r"^## " + re.escape(version) + r"\s*$(.*?)(?=^## |\Z)",
+                        changelog, re.M | re.S)
+          entry = m.group(1).strip() if m else ""
 
           print("## What's in this build" if entry else "## Release %s" % version)
           print()
@@ -176,8 +157,8 @@ jobs:
             dist/*
 
       # A manual run (Actions > build > Run workflow) republishes the current
-      # version's notes from its README entry, so an edited entry reaches an
-      # existing release without a new version. Assets are left alone.
+      # version's notes from its CHANGELOG.md entry, so an edited entry reaches
+      # an existing release without a new version. Assets are left alone.
       - name: Refresh release notes
         if: github.event_name == 'workflow_dispatch' && steps.released.outputs.exists == 'true'
         env:

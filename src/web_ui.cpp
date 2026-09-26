@@ -125,7 +125,7 @@ String statusSection() {
     s += "<tr><td>Bridged port</td><td>" + bridgedPortText() + "</td></tr>";
     s += "<tr><td>USB events</td><td>" + String(UsbMidi::eventCount()) + "</td></tr>";
     s += "<tr><td>USB &rarr; RTP</td><td>" + String(MidiBridge::forwardedCount()) +
-         " events</td></tr>";
+         " events in " + String(MidiBridge::uplinkPackets()) + " packets</td></tr>";
     s += "<tr><td>RTP &rarr; USB</td><td>" + String(MidiBridge::returnedCount()) + " events, " +
          String(UsbMidi::txPacketCount()) + " packets delivered, " +
          String(UsbMidi::txDropCount()) + " dropped</td></tr>";
@@ -422,13 +422,11 @@ void handleRoot() {
         page += "<option value='" + String(choice) + "'";
         if (c.txPower == choice) page += F(" selected");
         page += ">" + String(choice / 4.0, 1) + " dBm";
-        if (choice == Config::TX_POWER_DEFAULT) page += F(" (max)");
+        if (choice == Config::TX_POWER_DEFAULT) page += F(" (default)");
         page += F("</option>");
     }
-    page += F("</select><p><small>More power = more uplink margin. Lower it only if "
-              "serial-port glitches appear while flashing/monitoring at the bench "
-              "(full power has induced them with the UART cabled; deployed with "
-              "nothing on the UART it is harmless).</small></p>"
+    page += F("</select><p><small>Power above ~8.5 dBm has been shown to cause brownouts "
+              "on some ESP32 boards. Use with caution.</small></p>"
               "<label>Web UI password <small>(");
     page += c.webPass.length() ? F("set; blank = keep current") : F("not set; blank = stays off");
     page += F(")</small></label><input type='password' name='webpass' maxlength='63' value=''>"
@@ -794,6 +792,8 @@ void handleDiag() {
     s += String(UsbMidi::txDropCount());
     s += "\nusb_to_rtp_events=";
     s += String(MidiBridge::forwardedCount());
+    s += "\nusb_to_rtp_packets=";
+    s += String(MidiBridge::uplinkPackets());
     s += "\nhealthy=";
     s += String(UsbMidi::healthy() ? 1 : 0);
     s += "\nusb_port=";
