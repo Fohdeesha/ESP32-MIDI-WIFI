@@ -48,8 +48,8 @@ board, flash the merged image over the UART port:
 esptool --chip esp32s3 write_flash 0x0 ESP32-MIDI-WIFI-<version>-merged.bin
 ```
 
-After that, update over WiFi with the plain `.bin`, either from the web page or
-with curl:
+After that, update over WiFi: open the web page and upload the plain `.bin`
+under Firmware update. Or with curl:
 
 ```sh
 curl -u admin:<password> -F "fw=@ESP32-MIDI-WIFI-<version>.bin" http://esp32-midi.local/update

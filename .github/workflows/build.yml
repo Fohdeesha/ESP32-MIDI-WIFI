@@ -116,31 +116,8 @@ jobs:
                         changelog, re.M | re.S)
           entry = m.group(1).strip() if m else ""
 
-          print("## What's in this build" if entry else "## Release %s" % version)
-          print()
-          if entry:
-              print(entry)
-              print()
-          print("## Flashing")
-          print()
-          print("**Over the air** (device already on your network):")
-          print()
-          print("```sh")
-          print("curl -u admin:<password> -F \"fw=@ESP32-MIDI-WIFI-%s.bin\" \\" % version)
-          print("     http://esp32-midi.local/update")
-          print("```")
-          print()
-          print("**Blank board over USB** (UART port):")
-          print()
-          print("```sh")
-          print("esptool --chip esp32s3 write_flash 0x0 ESP32-MIDI-WIFI-%s-merged.bin" % version)
-          print("```")
-          print()
-          print("| Asset | Use |")
-          print("| --- | --- |")
-          print("| `ESP32-MIDI-WIFI-%s.bin` | application image - OTA upload |" % version)
-          print("| `ESP32-MIDI-WIFI-%s-merged.bin` | full flash image at offset 0x0 - first flash |" % version)
-          print("| `bootloader.bin`, `partitions.bin` | components, if flashing pieces separately |")
+          # Just the changes. Install steps live in the README.
+          print(entry if entry else "Release %s" % version)
           PY
           cat notes.md
 
