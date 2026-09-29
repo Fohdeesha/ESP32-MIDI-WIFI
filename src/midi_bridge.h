@@ -9,17 +9,20 @@ namespace MidiBridge {
 // Config::CABLE_SAME for outCable to keep the return path on the same cable as
 // the input -- what a control surface needs, since it expects its LEDs back on
 // the port it sent from. With CABLE_ALL in, there is no single cable to
-// follow, so CABLE_SAME resolves to cable 0. Call once from setup() after
-// Config::load(); the settings only change across a reboot, which is what
-// saving config does.
+// follow, so CABLE_SAME resolves to cable 0. Call once from MidiTask::begin(),
+// before the task starts; the settings only change across a reboot, which is
+// what saving config does.
+//
+// Everything below but bridgedCable(), outputCable() and the three counters
+// belongs to the MIDI task (see midi_task.h).
 void begin(uint8_t cable, uint8_t outCable);
 uint8_t bridgedCable();  // input selection, Config::CABLE_ALL when merged
 uint8_t outputCable();   // resolved output cable, always a real 0-15
 // Drains parsed USB MIDI packets and forwards the selected cable into the
-// RTP-MIDI session (other cables are logged but not bridged). Call from
-// loop after RtpMidi::tick().
+// RTP-MIDI session (other cables are logged but not bridged). Call after
+// RtpMidi::tick().
 void tick();
-// Session-health tick (1.2.0), call from loop after tick():
+// Session-health tick (1.2.0), call after tick():
 //   * While a peer is connected AND the USB device is healthy
 //     (UsbMidi::healthy() -- attached, IN pipeline live, OUT ACKs flowing),
 //     sends MIDI Active Sensing (0xFE) every 250 ms. Hosts can treat its
@@ -42,8 +45,8 @@ uint32_t forwardedCount();  // USB -> RTP events sent to a peer
 uint32_t uplinkPackets();   // ...and the batches they went out in (~datagrams)
 uint32_t returnedCount();   // RTP -> USB events queued toward the device
 
-// RTP receive entry points, called from RtpMidi's MIDI callbacks (loop
-// context). channel is 1-16; sysex data includes the F0/F7 framing.
+// RTP receive entry points, called from RtpMidi's MIDI callbacks (the MIDI
+// task). channel is 1-16; sysex data includes the F0/F7 framing.
 void rtpNoteOn(uint8_t channel, uint8_t note, uint8_t velocity);
 void rtpNoteOff(uint8_t channel, uint8_t note, uint8_t velocity);
 void rtpControlChange(uint8_t channel, uint8_t controller, uint8_t value);

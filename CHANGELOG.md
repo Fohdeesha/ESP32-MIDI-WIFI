@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.8.0
+
+- MIDI runs in its own task, above the web server. Loading the page or a slow
+  client no longer holds up MIDI, and a firmware upload only pauses it briefly
+  while flash is written.
+- Serial logging from the MIDI path is queued instead of blocking it.
+- Status page shows MIDI task timing and the lowest free heap.
+- `/diag` gains `midi_task=`, `loop=`, `log_drops=`, `heap_min=` and
+  `stacks=`.
+
 ## 1.7.3
 
 - TX power defaults to 8.5 dBm, max 11 dBm. Higher power made WiFi fall apart

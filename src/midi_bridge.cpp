@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "config.h"
+#include "log_queue.h"
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
 
@@ -98,24 +99,25 @@ void sysexPacket(const uint8_t p[4]) {
 // here however fast the USB client task refills the queue while it drains.
 constexpr int USB_BATCH = 128;
 static_assert(SYSEX_SEG + 1 + USB_BATCH * 5 + 64 <= 1400,
-              "one loop's USB->RTP output must fit one WiFiUDP datagram");
+              "one pass's USB->RTP output must fit one WiFiUDP datagram");
 
 bool s_tickPeer = false;  // RtpMidi::hasPeer() as the last tick() saw it
 
-// Uplink pacing (1.7.3). Everything queued in one loop pass leaves as one
-// datagram, and the loop runs ~480 times a second, so a busy surface (a few
-// faders moving) went out as several hundred small packets a second -- each a
-// burst of transmit current, which counts on a marginal supply. A token bucket
-// now paces the drain: after a quiet spell up to UPLINK_BURST packets leave
-// back to back, so a note, chord or button press is never held, while a
-// sustained stream gets one packet per UPLINK_TOKEN_MS carrying everything
-// queued since the last. Nothing is dropped or merged; a message waits at most
-// UPLINK_TOKEN_MS (the USB queue holds 128, far more than that fills with).
+// Uplink pacing (1.7.3). Everything queued in one pass leaves as one datagram,
+// and passes ran ~480 times a second (up to 1000 in the MIDI task, 1.8.0), so
+// a busy surface (a few faders moving) went out as several hundred small
+// packets a second -- each a burst of transmit current, which counts on a
+// marginal supply. A token bucket now paces the drain: after a quiet spell up
+// to UPLINK_BURST packets leave back to back, so a note, chord or button press
+// is never held, while a sustained stream gets one packet per UPLINK_TOKEN_MS
+// carrying everything queued since the last. Nothing is dropped or merged; a
+// message waits at most UPLINK_TOKEN_MS (the USB queue holds 128, far more
+// than that fills with).
 constexpr uint32_t UPLINK_TOKEN_MS = 10;
 constexpr uint8_t UPLINK_BURST = 4;
 uint8_t s_upTokens = UPLINK_BURST;
 uint32_t s_upRefillMs = 0;
-uint32_t s_upPackets = 0;  // loop passes that forwarded anything (~datagrams)
+uint32_t s_upPackets = 0;  // passes that forwarded anything (~datagrams)
 
 bool uplinkReady(uint32_t now) {
     while (s_upTokens < UPLINK_BURST && now - s_upRefillMs >= UPLINK_TOKEN_MS) {
@@ -406,8 +408,7 @@ void sendDeviceMarker(bool attached) {
                                0x42, attached ? (uint8_t)0x01 : (uint8_t)0x00,
                                0xF7};
     RtpMidi::sendSysEx(marker, sizeof(marker));
-    Serial.printf("[health] device %s marker sent\n",
-                  attached ? "attached" : "detached");
+    LogQueue::printf("[health] device %s marker sent", attached ? "attached" : "detached");
 }
 }  // namespace
 
@@ -483,7 +484,7 @@ void MidiBridge::blankSurface() {
     // first, so the device's parser is back at a message boundary.
     if (s_sxOpen) sxEnd();
     if (!UsbMidi::deviceConnected()) return;
-    Serial.println("[health] session gone -- blanking the surface");
+    LogQueue::printf("[health] session gone -- blanking the surface");
     // Both scribble families an Icon P1-M carries: the classic MCU header and
     // Icon's extended second pair. Harmless elsewhere (unknown sysex is
     // ignored), and each family's two halves cover all four D-4T rows.

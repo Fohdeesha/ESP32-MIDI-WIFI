@@ -6,10 +6,15 @@
 
 #include "boot_guard.h"
 #include "config.h"
+#include "log_queue.h"
 #include "midi_bridge.h"
+#include "midi_task.h"
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
 #include "wifi_net.h"
+
+// Runs in the loop task, below the MIDI task: MIDI state comes from
+// MidiTask::snapshot() or a module's locked copy, per midi_task.h.
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.0.0-dev"
@@ -92,6 +97,8 @@ String portWarning() {
 }
 
 String statusSection() {
+    MidiTask::Snapshot snap;
+    MidiTask::snapshot(snap);
     String s = F("<h2>Status</h2><table>");
     s += "<tr><td>Firmware</td><td>v" FW_VERSION "</td></tr>";
     s += "<tr><td>IP</td><td>" + WiFi.localIP().toString() +
@@ -107,11 +114,17 @@ String statusSection() {
         WifiNet::appendDiag(w);
         s += "<tr><td>WiFi health</td><td>" + htmlEscape(w) + "</td></tr>";
     }
-    String peers = String(RtpMidi::peerCount());
-    if (Config::get().targetIp.length() && RtpMidi::peerCount() == 0) {
+    String peers = String(snap.peerCount);
+    if (Config::get().targetIp.length() && snap.peerCount == 0) {
         peers += " (inviting " + htmlEscape(Config::get().targetIp) + ":" +
                  String(Config::get().targetPort) + ")";
     }
+    const int named = snap.peerCount < RtpMidi::MAX_PEERS ? snap.peerCount : RtpMidi::MAX_PEERS;
+    for (int i = 0; i < named; i++) {
+        peers += i ? ", " : " (";
+        peers += htmlEscape(snap.peerNames[i]);
+    }
+    if (named > 0) peers += ")";
     s += "<tr><td>RTP-MIDI peers</td><td>" + peers + "</td></tr>";
     s += "<tr><td>USB MIDI</td><td>" + htmlEscape(UsbMidi::statusText()) + "</td></tr>";
     {
@@ -123,12 +136,12 @@ String statusSection() {
         s += "<tr><td>USB port</td><td>" + htmlEscape(p) + "</td></tr>";
     }
     s += "<tr><td>Bridged port</td><td>" + bridgedPortText() + "</td></tr>";
-    s += "<tr><td>USB events</td><td>" + String(UsbMidi::eventCount()) + "</td></tr>";
-    s += "<tr><td>USB &rarr; RTP</td><td>" + String(MidiBridge::forwardedCount()) +
-         " events in " + String(MidiBridge::uplinkPackets()) + " packets</td></tr>";
-    s += "<tr><td>RTP &rarr; USB</td><td>" + String(MidiBridge::returnedCount()) + " events, " +
-         String(UsbMidi::txPacketCount()) + " packets delivered, " +
-         String(UsbMidi::txDropCount()) + " dropped</td></tr>";
+    s += "<tr><td>USB events</td><td>" + String(snap.usbEvents) + "</td></tr>";
+    s += "<tr><td>USB &rarr; RTP</td><td>" + String(snap.forwarded) + " events in " +
+         String(snap.uplinkPackets) + " packets</td></tr>";
+    s += "<tr><td>RTP &rarr; USB</td><td>" + String(snap.returned) + " events, " +
+         String(snap.txDelivered) + " packets delivered, " + String(snap.txDropped) +
+         " dropped</td></tr>";
     {
         String d;
         UsbMidi::appendRxDiag(d);
@@ -139,13 +152,19 @@ String statusSection() {
         UsbMidi::appendTxDiag(d);
         s += "<tr><td>OUT pipeline</td><td>" + htmlEscape(d) + "</td></tr>";
     }
+    // MIDI task timing (1.8.0): pass = time spent forwarding per wake-up,
+    // period = longest gap between wake-ups, which is the added latency.
+    s += "<tr><td>MIDI task</td><td>pass max " + String(snap.passMaxUs) + " us, mean " +
+         String(snap.passMeanUs) + " us, period max " + String(snap.periodMaxUs) +
+         " us, stack free " + String(snap.stackFree) + " B</td></tr>";
     s += "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>";
-    s += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " kB</td></tr>";
+    s += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " kB (lowest " +
+         String(ESP.getMinFreeHeap() / 1024) + " kB)</td></tr>";
     s += F("</table>");
     // The log rings are long and only wanted when something is being diagnosed,
     // so they collapse like the descriptor dump rather than pushing the status
     // table off the top of the page.
-    if (UsbMidi::eventCount() > 0) {
+    if (snap.usbEvents > 0) {
         String ev;
         UsbMidi::appendRecentEvents(ev, "\n");
         s += F("<details class='nets'><summary>Recent MIDI from the device</summary>"
@@ -185,10 +204,13 @@ String statusSection() {
         s += htmlEscape(ev);
         s += F("</pre></details>");
     }
-    if (UsbMidi::descriptorDump()[0]) {
-        s += F("<details class='nets'><summary>USB descriptors</summary><pre>");
-        s += htmlEscape(UsbMidi::descriptorDump());
-        s += F("</pre></details>");
+    {
+        const String desc = UsbMidi::descriptorDump();
+        if (desc.length()) {
+            s += F("<details class='nets'><summary>USB descriptors</summary><pre>");
+            s += htmlEscape(desc);
+            s += F("</pre></details>");
+        }
     }
     return s;
 }
@@ -310,7 +332,7 @@ String usbIfaceOptions(uint8_t sel) {
 // declared count and the user can pick any of them. The declared count is read
 // per direction -- a device's in and out cable counts are independent, which is
 // the whole reason the output port is its own setting.
-String usbCableOptions(uint8_t sel, bool output) {
+String usbCableOptions(uint8_t sel, bool output, const MidiTask::Snapshot& snap) {
     UsbMidi::IfaceInfo f;
     uint8_t declared = 0;
     if (UsbMidi::claimedInterfaceInfo(f)) declared = output ? f.outCables : f.inCables;
@@ -330,7 +352,7 @@ String usbCableOptions(uint8_t sel, bool output) {
         o += ">Port " + String(c + 1) + " (cable " + String(c) + ")";
         if (declared && c < declared) o += F(" &mdash; on the device");
         if (!output) {  // inbound traffic is evidence; outbound is our own doing
-            uint32_t seen = UsbMidi::cableRxCount(c);
+            uint32_t seen = snap.cableRx[c];
             if (seen) o += " &mdash; " + String(seen) + " events seen";
         }
         o += F("</option>");
@@ -341,16 +363,17 @@ String usbCableOptions(uint8_t sel, bool output) {
 void handleRoot() {
     if (!authOk()) return server.requestAuthentication();
     const Config::Values& c = Config::get();
+    MidiTask::Snapshot snap;
+    MidiTask::snapshot(snap);
     String page;
-    // Reserve the whole page up front (1.5.4, bridge audit F-12). This handler
-    // runs SYNCHRONOUSLY inside loop() -- the same loop that pumps USB->RTP MIDI,
-    // where main.cpp's comment rightly says nothing in here may block -- and it
-    // builds a ~14 kB page by dozens of String += appends. Every append that
-    // outgrows the buffer reallocs and copies the whole page so far, so an
-    // unreserved build is quadratic heap churn (and fragments the heap) while the
-    // MIDI pump waits. One reservation removes essentially all of it. The
-    // residual stall is the TCP send, which is bounded and only paid when
-    // somebody actually loads the page -- so do not add an auto-refresh here.
+    // Reserve the whole page up front (1.5.4, bridge audit F-12). The page is
+    // ~14 kB built by dozens of String += appends, and every append that
+    // outgrows the buffer reallocs and copies the whole page so far: quadratic
+    // heap churn that also fragments the heap. One reservation removes
+    // essentially all of it. Until 1.8.0 this ran in the same loop that pumped
+    // MIDI, which waited out the whole build and TCP send; the MIDI task now
+    // preempts it. What a load still costs is airtime on a board whose supply
+    // limits transmit, so do not add an auto-refresh here.
     page.reserve(16384);
     page += FPSTR(PAGE_HEAD);
     page += statusSection();
@@ -381,12 +404,12 @@ void handleRoot() {
     page += F("</select>"
               "<label>USB MIDI port, device &rarr; network <small>(a device's virtual "
               "cables are the ports a DAW would list)</small></label><select name='ucab'>");
-    page += usbCableOptions(c.usbCable, false);
+    page += usbCableOptions(c.usbCable, false, snap);
     page += F("</select>"
               "<label>USB MIDI port, network &rarr; device <small>(leave on \"same as "
               "above\" unless the device is asymmetric)</small></label>"
               "<select name='ucabo'>");
-    page += usbCableOptions(c.usbCableOut, true);
+    page += usbCableOptions(c.usbCableOut, true, snap);
     page += F("</select><p><small>Currently bridging ");
     page += bridgedPortText();
     page += F(". RTP-MIDI carries no port number, so one port is bridged per direction, "
@@ -769,10 +792,13 @@ void handleRebootPost() {
 }
 
 // Deliberately NOT part of the status page: that page is ~14 kB assembled by
-// repeated String concatenation inside the same task that pumps MIDI, so
-// polling it perturbs exactly the timing a throughput measurement is trying to
-// read. This is a few hundred bytes of plain text, cheap enough to sample once
-// a second during a load ramp without becoming part of the experiment.
+// repeated String concatenation, which until 1.8.0 ran in the same task that
+// pumped MIDI, so polling it perturbed exactly the timing a throughput
+// measurement is trying to read. This is a few hundred bytes of plain text,
+// cheap enough to sample once a second during a load ramp without becoming
+// part of the experiment. The counters are single-writer 32-bit values read
+// live rather than from the 100 ms snapshot, since the VM tooling diffs them.
+// New keys are only ever appended: that tooling parses these lines.
 void handleDiag() {
     if (!authOk()) return server.requestAuthentication();
     String s;
@@ -808,6 +834,27 @@ void handleDiag() {
     UsbMidi::appendTxDiag(s);
     s += "\nin=";
     UsbMidi::appendRxDiag(s);
+    {
+        // 1.8.0: where the time goes. A page load should show in loop= and
+        // never in midi_task=.
+        MidiTask::Snapshot snap;
+        MidiTask::snapshot(snap);
+        // Worst case ~260 bytes with every counter at 10 digits.
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+                 "\nmidi_task=pass_max_us=%lu pass_mean_us=%lu period_max_us=%lu "
+                 "wakes_usb=%lu wakes_timer=%lu stack_free=%lu"
+                 "\nloop=period_max_us=%lu\nlog_drops=%lu\nheap_min=%lu"
+                 "\nstacks=loop=%lu usbh_client=%lu",
+                 (unsigned long)snap.passMaxUs, (unsigned long)snap.passMeanUs,
+                 (unsigned long)snap.periodMaxUs, (unsigned long)snap.wakesUsb,
+                 (unsigned long)snap.wakesTimer, (unsigned long)snap.stackFree,
+                 (unsigned long)BootGuard::loopPeriodMaxUs(),
+                 (unsigned long)LogQueue::drops(), (unsigned long)ESP.getMinFreeHeap(),
+                 (unsigned long)uxTaskGetStackHighWaterMark(nullptr),
+                 (unsigned long)UsbMidi::clientStackFree());
+        s += buf;
+    }
     s += "\n";
     server.send(200, "text/plain", s);
 }
@@ -819,6 +866,8 @@ void handleDiagReset() {
     if (!authOk()) return server.requestAuthentication();
     if (refuseCrossOrigin()) return;
     UsbMidi::resetDiag();
+    MidiTask::resetStats();
+    BootGuard::resetLoopStats();
     server.send(200, "text/plain", "ok\n");
 }
 

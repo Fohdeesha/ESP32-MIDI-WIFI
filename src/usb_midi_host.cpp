@@ -50,25 +50,34 @@ uint8_t s_epOut = 0;  // OUT endpoint address; 0 = device has no MIDI input
 uint16_t s_epOutMps = 64;
 
 // Every MIDIStreaming interface of the attached device, for the web UI picker,
-// plus which one the user asked for and which one we ended up claiming.
+// plus which one the user asked for and which one we ended up claiming. The
+// client task writes the list; the web server copies it out under s_textMux.
 UsbMidi::IfaceInfo s_ifaceList[MAX_MIDI_IFACES];
 uint8_t s_ifaceListCount = 0;
+UsbMidi::IfaceInfo s_ifaceScratch[MAX_MIDI_IFACES];  // built here, then published
 uint8_t s_prefIface = 0xFF;     // configured bInterfaceNumber, 0xFF = auto
+// The claimed interface and alt setting, written together under s_textMux.
 uint8_t s_claimedIface = 0xFF;  // 0xFF = nothing claimed
+uint8_t s_claimedAlt = 0;
 bool s_ifaceFallback = false;   // configured interface absent on this device
-uint32_t s_cableRx[16] = {};    // packets per virtual cable, since attach
+// Packets per virtual cable, since attach. The MIDI task is the only writer:
+// an attach just asks it to start over, since a memset from the client task
+// could land in the middle of its increment and bring an old count back.
+uint32_t s_cableRx[16] = {};
+volatile bool s_cableRxReset = false;
+TaskHandle_t s_clientTask = nullptr;
 usb_transfer_t* s_xfers[NUM_RX_TRANSFERS] = {};
 usb_transfer_t* s_txXfer = nullptr;
 QueueHandle_t s_txQueue = nullptr;
 bool s_txInFlight = false;  // touched only from the client task
 uint32_t s_txDone = 0;
-uint32_t s_txDropped = 0;  // loop task: packets lost to a full TX queue (post-backpressure)
+uint32_t s_txDropped = 0;  // MIDI task: packets lost to a full TX queue (post-backpressure)
 // Client task: packets in transfers that failed, or stranded in the queue by a
 // detach. Separate from s_txDropped because each counter has ONE writer task --
 // two tasks read-modify-writing one counter lose increments.
 volatile uint32_t s_txLost = 0;
 volatile int s_inFlight = 0;
-// Health bookkeeping (read from the loop task by healthy()):
+// Health bookkeeping (read from other tasks by healthy()):
 // s_rxActive counts IN transfers currently submitted. A transfer that errors
 // (or whose resubmit fails) goes idle and is counted OUT -- when all are idle
 // the device is deaf even though it still enumerates.
@@ -101,7 +110,9 @@ volatile uint32_t s_rxErrors = 0;       // IN transfers that errored
 volatile uint32_t s_rxRecovered = 0;    // ...of those, resubmitted successfully
 volatile uint32_t s_rxRetired = 0;      // taken out of the active set (depth--): parked
                                         // for recovery, or the device went away
-volatile uint32_t s_rxQueueDrops = 0;   // packets lost to a full RX queue (loop behind)
+volatile uint32_t s_rxQueueDrops = 0;   // packets lost to a full RX queue (MIDI task behind)
+// Task woken whenever IN packets are queued (the MIDI task), or null.
+TaskHandle_t volatile s_rxNotify = nullptr;
 
 // --- OUT-pipeline instrumentation ------------------------------------------
 // healthy() has always been able to say "an OUT transfer has sat unACKed for
@@ -146,11 +157,32 @@ volatile uint8_t s_pendingAddr = 0;
 volatile bool s_pendingGone = false;
 volatile bool s_connected = false;
 char s_productName[64] = "";
+
+// Human-readable host state for the web UI. Only the client task writes it
+// (and begin(), before that task exists), always through setStatus(): format
+// into the scratch copy, then publish it under s_textMux, which also guards
+// the interface list. The web server copies both out under the same lock.
 char s_statusText[192] = "not started";
+char s_statusNext[sizeof(s_statusText)];
+portMUX_TYPE s_textMux = portMUX_INITIALIZER_UNLOCKED;
+
+void setStatus(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void setStatus(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_statusNext, sizeof(s_statusNext), fmt, ap);
+    va_end(ap);
+    portENTER_CRITICAL(&s_textMux);
+    memcpy(s_statusText, s_statusNext, sizeof(s_statusText));
+    portEXIT_CRITICAL(&s_textMux);
+}
 
 // Raw + parsed config descriptor of the last attached device, for the web
-// UI's debug view. Filled once per attach, before s_connected flips.
+// UI's debug view. Filled once per attach, before s_connected flips. 4 kB is
+// too much to copy under a spinlock, so readers check a generation count
+// instead: odd while the client task is writing, bumped again when done.
 char s_descDump[4096] = "";
+volatile uint32_t s_descGen = 0;
 
 // --- Enumeration recovery (1.7.1) ------------------------------------------
 // ESP-IDF 4.4's hub driver makes exactly ONE enumeration attempt per
@@ -246,7 +278,8 @@ bool s_resetWanted = false;     // escalation requested from a transfer callback
 uint32_t s_lastTroubleMs = 0;   // last endpoint error or reset
 uint32_t s_lastResetMs = 0;
 uint8_t s_resetStreak = 0;      // resets since the last calm period
-// Read by the loop task too (healthy(), writePacket(), appendPortDiag()):
+// Read by other tasks too (healthy() and writePacket() in the MIDI task,
+// appendPortDiag() in the web server):
 volatile bool s_txHalted = false;     // OUT pipe errored or refused: needs a clear
 volatile bool s_resetPending = false; // reset injected, DEV_GONE not seen yet
 volatile uint32_t s_epClears = 0;
@@ -319,7 +352,7 @@ bool isEpDesc(const uint8_t* p) {
     return p[1] == USB_B_DESCRIPTOR_TYPE_ENDPOINT && p[0] >= sizeof(usb_ep_desc_t);
 }
 
-void dumpDescriptors(const usb_config_desc_t* cfg) {
+void formatDescriptors(const usb_config_desc_t* cfg) {
     s_descDump[0] = '\0';
     if (!cfg) return;
     size_t off = 0;
@@ -350,6 +383,12 @@ void dumpDescriptors(const usb_config_desc_t* cfg) {
         if (off >= sizeof(s_descDump)) off = sizeof(s_descDump) - 1;
         p += len;
     }
+}
+
+void dumpDescriptors(const usb_config_desc_t* cfg) {
+    s_descGen++;  // odd: being written (see s_descGen)
+    formatDescriptors(cfg);
+    s_descGen++;
 }
 
 void utf16ToAscii(const usb_str_desc_t* sd, char* out, size_t outLen) {
@@ -417,15 +456,23 @@ void onTransferDone(usb_transfer_t* xfer) {
         // A FULL buffer means the device had at least this much already queued
         // -- the signature of it accumulating between polls.
         if (xfer->actual_num_bytes >= xfer->data_buffer_size) s_rxFullXfers++;
+        bool queued = false;
         for (int i = 0; i + 3 < xfer->actual_num_bytes; i += 4) {
             const uint8_t* p = &xfer->data_buffer[i];
             if ((p[0] & 0x0F) == 0) continue;  // CIN 0 = reserved/padding
             MidiPacket pkt;
             memcpy(pkt.b, p, 4);
-            // Full queue: drop, never block -- but count it, or a stalled loop
-            // silently tearing a SysEx apart could never be seen.
-            if (xQueueSend(s_queue, &pkt, 0) != pdTRUE) s_rxQueueDrops++;
+            // Full queue: drop, never block -- but count it, or a stalled MIDI
+            // task silently tearing a SysEx apart could never be seen.
+            if (xQueueSend(s_queue, &pkt, 0) == pdTRUE) {
+                queued = true;
+            } else {
+                s_rxQueueDrops++;
+            }
         }
+        // Wake the MIDI task now rather than at its next 1 ms poll (1.8.0).
+        TaskHandle_t notify = s_rxNotify;
+        if (queued && notify) xTaskNotifyGive(notify);
         if (usb_host_transfer_submit(xfer) == ESP_OK) {
             const uint32_t sub_us = micros();
             // resub: how long the endpoint went unpolled by THIS slot
@@ -566,7 +613,7 @@ void enumerateMidiIfaces(const usb_config_desc_t* cfg) {
                 if (isIfaceDesc(p) && id->bInterfaceClass == USB_CLASS_AUDIO_ &&
                     id->bInterfaceSubClass == USB_SUBCLASS_MIDI_STREAMING &&
                     count < MAX_MIDI_IFACES) {
-                    cur = &s_ifaceList[count++];
+                    cur = &s_ifaceScratch[count++];
                     *cur = UsbMidi::IfaceInfo{};
                     cur->num = id->bInterfaceNumber;
                     cur->alt = id->bAlternateSetting;
@@ -601,7 +648,11 @@ void enumerateMidiIfaces(const usb_config_desc_t* cfg) {
             p += p[0];
         }
     }
-    s_ifaceListCount = count;  // publish only once the entries are filled
+    // Publish only once the entries are filled, and in one piece.
+    portENTER_CRITICAL(&s_textMux);
+    memcpy(s_ifaceList, s_ifaceScratch, sizeof(s_ifaceList));
+    s_ifaceListCount = count;
+    portEXIT_CRITICAL(&s_textMux);
 }
 
 // Index of the first usable interface, optionally restricted to one
@@ -738,7 +789,7 @@ void attachDevice(uint8_t addr) {
     if (s_device) return;  // single-device bridge; ignore extra plugs
     if (usb_host_device_open(s_client, addr, &s_device) != ESP_OK) {
         Serial.println("[usb] device_open failed");
-        snprintf(s_statusText, sizeof(s_statusText), "device seen but open failed");
+        setStatus("device seen but open failed");
         s_device = nullptr;
         return;
     }
@@ -754,13 +805,13 @@ void attachDevice(uint8_t addr) {
     dumpDescriptors(cfg);       // dump shows the device's original values
     clampFullSpeedMps(cfg);     // ...then sanitize before claiming
     enumerateMidiIfaces(cfg);
-    memset(s_cableRx, 0, sizeof(s_cableRx));  // counts are per-attach
+    s_cableRxReset = true;  // counts are per-attach (see s_cableRx)
 
     int pick = chooseIface();
     if (pick < 0 || !prepareIface(pick)) {
         Serial.println("[usb] no usable MIDIStreaming interface -- not a USB MIDI device?");
-        snprintf(s_statusText, sizeof(s_statusText), "\"%s\" (%04x:%04x): no MIDI interface",
-                 s_productName, dd ? dd->idVendor : 0, dd ? dd->idProduct : 0);
+        setStatus("\"%s\" (%04x:%04x): no MIDI interface", s_productName,
+                  dd ? dd->idVendor : 0, dd ? dd->idProduct : 0);
         usb_host_device_close(s_client, s_device);
         s_device = nullptr;
         s_productName[0] = '\0';
@@ -784,8 +835,8 @@ void attachDevice(uint8_t addr) {
     }
     if (cerr != ESP_OK) {
         Serial.printf("[usb] interface_claim failed: %s\n", esp_err_to_name(cerr));
-        snprintf(s_statusText, sizeof(s_statusText), "\"%s\": claim if %u alt %u failed: %s",
-                 s_productName, s_ifaceNum, s_ifaceAlt, esp_err_to_name(cerr));
+        setStatus("\"%s\": claim if %u alt %u failed: %s", s_productName, s_ifaceNum,
+                  s_ifaceAlt, esp_err_to_name(cerr));
         usb_host_device_close(s_client, s_device);
         s_device = nullptr;
         s_productName[0] = '\0';
@@ -797,10 +848,13 @@ void attachDevice(uint8_t addr) {
     // device, not this one.
     discardTxQueue();
     s_connected = true;
+    portENTER_CRITICAL(&s_textMux);
     s_claimedIface = s_ifaceNum;
-    snprintf(s_statusText, sizeof(s_statusText), "connected: \"%s\" on interface %u%s%s",
-             s_productName, s_ifaceNum, s_epIn ? "" : " (device-bound only)",
-             s_ifaceFallback ? " -- configured interface absent" : "");
+    s_claimedAlt = s_ifaceAlt;
+    portEXIT_CRITICAL(&s_textMux);
+    setStatus("connected: \"%s\" on interface %u%s%s", s_productName, s_ifaceNum,
+              s_epIn ? "" : " (device-bound only)",
+              s_ifaceFallback ? " -- configured interface absent" : "");
     s_rxActive = 0;
     // Instrumentation is per-attach, like s_cableRx.
     s_rxLastDoneUs = 0; s_rxDwellMaxUs = 0; s_rxResubMaxUs = 0; s_rxGapMaxUs = 0;
@@ -852,10 +906,12 @@ void detachDevice() {
     s_rxActive = 0;
     s_epIn = 0;
     s_epOut = 0;
+    portENTER_CRITICAL(&s_textMux);
     s_claimedIface = 0xFF;
+    portEXIT_CRITICAL(&s_textMux);
     s_ifaceFallback = false;
     s_productName[0] = '\0';
-    snprintf(s_statusText, sizeof(s_statusText), "host active, no device");
+    setStatus("host active, no device");
     Serial.println("[usb] device disconnected");
 }
 
@@ -893,7 +949,7 @@ void enumWatchdog() {
         if (!s_absentSettled && now - s_absentSinceMs > ABSENT_SETTLE_MS) {
             s_absentSettled = true;
             s_retryStreak = 0;
-            snprintf(s_statusText, sizeof(s_statusText), "host active, no device");
+            setStatus("host active, no device");
         }
         return;
     }
@@ -924,8 +980,7 @@ void enumWatchdog() {
         // disable and no retry to offer from here (the stack errors say why).
         if (s_portState != PORT_RESET_FAILED) {
             s_portState = PORT_RESET_FAILED;
-            snprintf(s_statusText, sizeof(s_statusText),
-                     "device on the port, but its USB reset failed -- replug or power-cycle it");
+            setStatus("device on the port, but its USB reset failed -- replug or power-cycle it");
         }
         return;
     }
@@ -937,9 +992,8 @@ void enumWatchdog() {
     Serial.printf("[usb] device on the port but not enumerated for %lu ms -- retrying (#%lu)\n",
                   (unsigned long)(now - s_unenumSinceMs), (unsigned long)s_enumRetries);
     s_unenumSinceMs = 0;
-    snprintf(s_statusText, sizeof(s_statusText),
-             "device on the port did not enumerate -- retrying (retry %lu)",
-             (unsigned long)s_enumRetries);
+    setStatus("device on the port did not enumerate -- retrying (retry %lu)",
+              (unsigned long)s_enumRetries);
 }
 
 // Client pass: turns an escalation -- endpoint errors that clearing does not
@@ -988,8 +1042,7 @@ void escalate(uint32_t now) {
     injectPortError();
     Serial.printf("[usb] %s -- resetting the device's port (#%lu)\n", why,
                   (unsigned long)s_portResets);
-    snprintf(s_statusText, sizeof(s_statusText), "%s -- USB port reset (#%lu)", why,
-             (unsigned long)s_portResets);
+    setStatus("%s -- USB port reset (#%lu)", why, (unsigned long)s_portResets);
 }
 
 // One pass of the client task, separate from the loop so a host-side test can
@@ -1026,16 +1079,40 @@ void daemonTask(void*) {
 }
 
 // Recent decoded events, kept for the web UI (serial may be unplugged when
-// the board is deployed at the instrument). Written and read only from the
-// loop task, so no locking.
+// the board is deployed at the instrument). Written by the MIDI task
+// (readPacket), read by the web server: a line is formatted outside the lock
+// and only copied in under it, and readers copy the ring out the same way.
 constexpr int LOG_RING = 12;
-char s_ring[LOG_RING][48];
+constexpr size_t LOG_LINE = 48;
+char s_ring[LOG_RING][LOG_LINE];
 uint32_t s_eventCount = 0;
 // Same ring for the device-bound direction: with a configurable cable the
 // nibble actually stamped on outgoing packets has to be observable, not just
-// assumed. Written from the loop task only (writePacket), like the RX ring.
-char s_txRing[LOG_RING][48];
+// assumed. Written by the MIDI task too (writePacket), like the RX ring.
+char s_txRing[LOG_RING][LOG_LINE];
 uint32_t s_txFormatted = 0;
+portMUX_TYPE s_ringMux = portMUX_INITIALIZER_UNLOCKED;
+
+void ringPut(char (*ring)[LOG_LINE], uint32_t& count, const char* line) {
+    portENTER_CRITICAL(&s_ringMux);
+    memcpy(ring[count % LOG_RING], line, LOG_LINE);
+    count++;
+    portEXIT_CRITICAL(&s_ringMux);
+}
+
+void ringAppend(const char (*ring)[LOG_LINE], const uint32_t& count, String& out,
+                const char* sep) {
+    char copy[LOG_RING][LOG_LINE];
+    portENTER_CRITICAL(&s_ringMux);
+    memcpy(copy, ring, sizeof(copy));
+    const uint32_t total = count;
+    portEXIT_CRITICAL(&s_ringMux);
+    const uint32_t n = total < LOG_RING ? total : LOG_RING;
+    for (uint32_t i = 0; i < n; i++) {  // oldest first
+        if (i) out += sep;
+        out += copy[(total - n + i) % LOG_RING];
+    }
+}
 
 // Formats one decoded event into buf; returns false for events not worth
 // showing (realtime clock/active-sense spam, reserved CINs). The cable number
@@ -1097,6 +1174,8 @@ void UsbMidi::begin(uint8_t preferredInterface) {
     s_txQueue = xQueueCreate(1024, sizeof(MidiPacket));
     // Before the install, so even the first enumeration's errors are kept.
     s_prevVprintf = esp_log_set_vprintf(logHook);
+    // Before the client task exists: after that it is setStatus()'s only caller.
+    setStatus("host active, no device");
 
     usb_host_config_t hostCfg = {};
     hostCfg.skip_phy_setup = false;
@@ -1104,8 +1183,7 @@ void UsbMidi::begin(uint8_t preferredInterface) {
     esp_err_t err = usb_host_install(&hostCfg);
     if (err != ESP_OK) {
         Serial.printf("[usb] host install failed: %s\n", esp_err_to_name(err));
-        snprintf(s_statusText, sizeof(s_statusText), "host install failed: %s",
-                 esp_err_to_name(err));
+        setStatus("host install failed: %s", esp_err_to_name(err));
         return;
     }
 
@@ -1117,8 +1195,7 @@ void UsbMidi::begin(uint8_t preferredInterface) {
     err = usb_host_client_register(&clientCfg, &s_client);
     if (err != ESP_OK) {
         Serial.printf("[usb] client register failed: %s\n", esp_err_to_name(err));
-        snprintf(s_statusText, sizeof(s_statusText), "client register failed: %s",
-                 esp_err_to_name(err));
+        setStatus("client register failed: %s", esp_err_to_name(err));
         return;
     }
 
@@ -1127,28 +1204,37 @@ void UsbMidi::begin(uint8_t preferredInterface) {
     // 5 kB rather than 4: the hub driver's error logs run on it, and those
     // are now also formatted into the status page's ring (keepStackLine).
     xTaskCreatePinnedToCore(daemonTask, "usbh_daemon", 5120, nullptr, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(clientTask, "usbh_client", 4096, nullptr, 5, nullptr, 1);
-    snprintf(s_statusText, sizeof(s_statusText), "host active, no device");
+    xTaskCreatePinnedToCore(clientTask, "usbh_client", 4096, nullptr, 5, &s_clientTask, 1);
     Serial.println("[usb] host mode active, waiting for device on OTG port");
+}
+
+uint32_t UsbMidi::clientStackFree() {
+    return s_clientTask ? uxTaskGetStackHighWaterMark(s_clientTask) : 0;
 }
 
 bool UsbMidi::readPacket(uint8_t out[4]) {
     if (!s_queue) return false;
+    if (s_cableRxReset) {
+        s_cableRxReset = false;
+        memset(s_cableRx, 0, sizeof(s_cableRx));
+    }
     MidiPacket pkt;
     if (xQueueReceive(s_queue, &pkt, 0) != pdTRUE) return false;
     s_cableRx[pkt.b[0] >> 4]++;
-    char* slot = s_ring[s_eventCount % LOG_RING];
     // Deliberately NOT logged to Serial: this is the per-event USB->RTP
     // forwarding path, and Arduino-ESP32 gives HardwareSerial no TX ring
     // (_txBufferSize = 0), so every printf blocks at wire rate once the
     // 128-byte FIFO fills -- ~2 ms per event at 115200. A moving fader emits
     // >100 events/s, so the log alone cost ~25% of the loop. The web status
     // page's event ring is the diagnostic, and it is free.
-    if (formatPacket(pkt, slot, sizeof(s_ring[0]))) {
-        s_eventCount++;
-    }
+    char line[LOG_LINE];
+    if (formatPacket(pkt, line, sizeof(line))) ringPut(s_ring, s_eventCount, line);
     memcpy(out, pkt.b, 4);
     return true;
+}
+
+void UsbMidi::setRxNotify(TaskHandle_t task) {
+    s_rxNotify = task;
 }
 
 bool UsbMidi::writePacket(const uint8_t pkt[4]) {
@@ -1159,8 +1245,8 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
     // 20 ms is enough to ride out any burst the RTP side can produce.
     // But only while the device is taking packets at all. With the OUT side
     // stuck -- a transfer unaccepted for TX_STUCK_MS, a halted pipe, a reset
-    // on its way -- the queue never drains and each wait would stall the main
-    // loop 20 ms per packet (blankSurface() alone writes ~270): drop at once.
+    // on its way -- the queue never drains and each wait would stall the MIDI
+    // task 20 ms per packet (blankSurface() alone writes ~270): drop at once.
     const uint32_t sub = s_txSubmitMs;
     const bool stuck = s_txHalted || s_resetPending || (sub && millis() - sub > TX_STUCK_MS);
     if (xQueueSend(s_txQueue, pkt, stuck ? 0 : pdMS_TO_TICKS(20)) != pdTRUE) {
@@ -1178,9 +1264,8 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
     }
     MidiPacket rec;
     memcpy(rec.b, pkt, 4);
-    if (formatPacket(rec, s_txRing[s_txFormatted % LOG_RING], sizeof(s_txRing[0]))) {
-        s_txFormatted++;
-    }
+    char line[LOG_LINE];
+    if (formatPacket(rec, line, sizeof(line))) ringPut(s_txRing, s_txFormatted, line);
     usb_host_client_unblock(s_client);  // wake the client task to send now
     return true;
 }
@@ -1214,9 +1299,14 @@ uint8_t UsbMidi::ifaceCount() {
 }
 
 bool UsbMidi::ifaceAt(uint8_t i, IfaceInfo& out) {
-    if (i >= s_ifaceListCount) return false;
-    out = s_ifaceList[i];
-    return true;
+    bool ok = false;
+    portENTER_CRITICAL(&s_textMux);
+    if (i < s_ifaceListCount) {
+        out = s_ifaceList[i];
+        ok = true;
+    }
+    portEXIT_CRITICAL(&s_textMux);
+    return ok;
 }
 
 uint8_t UsbMidi::claimedInterface() {
@@ -1224,14 +1314,17 @@ uint8_t UsbMidi::claimedInterface() {
 }
 
 bool UsbMidi::claimedInterfaceInfo(IfaceInfo& out) {
-    if (s_claimedIface == 0xFF) return false;
-    for (uint8_t i = 0; i < s_ifaceListCount; i++) {
-        if (s_ifaceList[i].num == s_ifaceNum && s_ifaceList[i].alt == s_ifaceAlt) {
+    bool ok = false;
+    portENTER_CRITICAL(&s_textMux);
+    for (uint8_t i = 0; s_claimedIface != 0xFF && i < s_ifaceListCount; i++) {
+        if (s_ifaceList[i].num == s_claimedIface && s_ifaceList[i].alt == s_claimedAlt) {
             out = s_ifaceList[i];
-            return true;
+            ok = true;
+            break;
         }
     }
-    return false;
+    portEXIT_CRITICAL(&s_textMux);
+    return ok;
 }
 
 bool UsbMidi::interfaceFellBack() {
@@ -1242,20 +1335,31 @@ uint32_t UsbMidi::cableRxCount(uint8_t cable) {
     return cable < 16 ? s_cableRx[cable] : 0;
 }
 
-const char* UsbMidi::deviceName() {
-    return s_productName;
-}
-
-const char* UsbMidi::statusText() {
-    return s_statusText;
+String UsbMidi::statusText() {
+    char copy[sizeof(s_statusText)];
+    portENTER_CRITICAL(&s_textMux);
+    memcpy(copy, s_statusText, sizeof(copy));
+    portEXIT_CRITICAL(&s_textMux);
+    return String(copy);
 }
 
 uint32_t UsbMidi::eventCount() {
     return s_eventCount;
 }
 
-const char* UsbMidi::descriptorDump() {
-    return s_descDump;
+String UsbMidi::descriptorDump() {
+    // Seqlock read (see s_descGen). The writer runs at a higher priority on
+    // this same core, so a copy it interrupts is simply taken again.
+    for (int tries = 0; tries < 4; tries++) {
+        const uint32_t gen = s_descGen;
+        if (gen & 1) {
+            vTaskDelay(1);
+            continue;
+        }
+        String copy(s_descDump);
+        if (s_descGen == gen) return copy;
+    }
+    return String();
 }
 
 void UsbMidi::appendRxDiag(String& out) {
@@ -1323,19 +1427,11 @@ void UsbMidi::resetDiag() {
 }
 
 void UsbMidi::appendRecentEvents(String& out, const char* sep) {
-    uint32_t n = s_eventCount < LOG_RING ? s_eventCount : LOG_RING;
-    for (uint32_t i = 0; i < n; i++) {  // oldest first
-        if (i) out += sep;
-        out += s_ring[(s_eventCount - n + i) % LOG_RING];
-    }
+    ringAppend(s_ring, s_eventCount, out, sep);
 }
 
 void UsbMidi::appendRecentTxEvents(String& out, const char* sep) {
-    uint32_t n = s_txFormatted < LOG_RING ? s_txFormatted : LOG_RING;
-    for (uint32_t i = 0; i < n; i++) {  // oldest first
-        if (i) out += sep;
-        out += s_txRing[(s_txFormatted - n + i) % LOG_RING];
-    }
+    ringAppend(s_txRing, s_txFormatted, out, sep);
 }
 
 uint32_t UsbMidi::txFormattedCount() {

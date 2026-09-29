@@ -17,6 +17,8 @@ constexpr uint32_t LOOP_WDT_S = 30;
 Preferences prefs;
 bool stable = false;
 uint8_t s_fails = 0;  // the stored count, as last read or written
+uint32_t s_lastTickUs = 0;
+uint32_t s_loopPeriodMaxUs = 0;
 
 void setFailCount(uint8_t n) {
     if (n == s_fails) return;  // no NVS write when nothing changes
@@ -74,8 +76,9 @@ void BootGuard::begin() {
     // every loop() pass, and a pass stuck for LOOP_WDT_S panics into a
     // TASK_WDT reset -- counted above, and a headless bridge that hangs now
     // restarts itself instead of waiting for a power cycle. The loop task
-    // shares core 1 with the USB client task (priority 5), so that task
-    // spinning trips this too, by starving the loop.
+    // shares core 1 with the USB client task (priority 5) and the MIDI task
+    // (priority 4, which subscribes itself too), so either of those spinning
+    // trips this as well, by starving the loop.
     esp_task_wdt_init(LOOP_WDT_S, true);  // IDF 4.4: reconfigures the running TWDT
     enableLoopWDT();
 }
@@ -85,9 +88,22 @@ void BootGuard::feedWatchdog() {
 }
 
 void BootGuard::tick() {
+    const uint32_t nowUs = micros();
+    if (s_lastTickUs && nowUs - s_lastTickUs > s_loopPeriodMaxUs) {
+        s_loopPeriodMaxUs = nowUs - s_lastTickUs;
+    }
+    s_lastTickUs = nowUs;
     if (!stable && millis() > STABLE_AFTER_MS) {
         markStable();
     }
+}
+
+uint32_t BootGuard::loopPeriodMaxUs() {
+    return s_loopPeriodMaxUs;
+}
+
+void BootGuard::resetLoopStats() {
+    s_loopPeriodMaxUs = 0;
 }
 
 void BootGuard::markStable() {

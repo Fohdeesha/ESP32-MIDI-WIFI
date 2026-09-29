@@ -4,7 +4,7 @@
 #include <AppleMIDI.h>
 #include <WiFi.h>
 
-#include "config.h"
+#include "log_queue.h"
 #include "midi_bridge.h"
 
 // tools/patch_applemidi.py fixes a set of AppleMIDI 3.3.0 bugs at build time
@@ -73,9 +73,20 @@ struct EspMidiInterfaceSettings : public APPLEMIDI_NAMESPACE::AppleMIDISettings 
 };
 MIDI_NAMESPACE::MidiInterface<EspMidiSession, EspMidiInterfaceSettings> MIDI(AppleMIDI);
 
+static_assert(RtpMidi::MAX_PEERS == EspMidiSettings::MaxNumberOfParticipants,
+              "rtp_midi.h must match the library's participant limit");
+static_assert(RtpMidi::PEER_NAME_LEN == EspMidiSettings::MaxSessionNameLen,
+              "rtp_midi.h must match the library's session-name limit");
+
 namespace {
 bool started = false;
 uint32_t s_lastInviteMs = 0;
+
+// The settings the session needs, copied once by configure() (see the header).
+char s_name[RtpMidi::PEER_NAME_LEN + 1] = "ESP32-MIDI";
+IPAddress s_targetIp;
+uint16_t s_targetPort = 0;
+bool s_hasTarget = false;
 
 // Connected sessions, by the peer's SSRC (1.7.2). The library's callbacks do
 // not map one-to-one onto sessions: "connected" fires again for a
@@ -85,8 +96,8 @@ uint32_t s_lastInviteMs = 0;
 // after the last session ended (no blanking, and inviteTick() never inviting
 // again) or dropped to 0 under a live one (surface blanked, USB->RTP muted).
 // Keyed by identity, every callback is idempotent.
-constexpr int MAX_PEERS = EspMidiSettings::MaxNumberOfParticipants;
-constexpr size_t PEER_NAME_LEN = EspMidiSettings::MaxSessionNameLen;
+using RtpMidi::MAX_PEERS;
+using RtpMidi::PEER_NAME_LEN;
 APPLEMIDI_NAMESPACE::ssrc_t s_peerSsrc[MAX_PEERS];
 char s_peerName[MAX_PEERS][PEER_NAME_LEN + 1];
 int s_peerCount = 0;
@@ -100,19 +111,26 @@ int findPeer(APPLEMIDI_NAMESPACE::ssrc_t ssrc) {
 // Session-event ring for the web UI: connects, disconnects and library
 // exceptions with uptime stamps, so session drops are diagnosable on a
 // headless device (serial is unplugged while the board sits at the P1-M).
+// Written by the MIDI task, read by the web server: each line is formatted
+// outside the lock and only copied in under it.
 constexpr int EVLOG_SIZE = 24;
-char s_evlog[EVLOG_SIZE][64];
+constexpr size_t EVLOG_LINE = 64;
+char s_evlog[EVLOG_SIZE][EVLOG_LINE];
 int s_evlogNext = 0;
+portMUX_TYPE s_evlogMux = portMUX_INITIALIZER_UNLOCKED;
 
 void evlog(const char* fmt, ...) {
+    char line[EVLOG_LINE];
     va_list ap;
     va_start(ap, fmt);
-    char* dst = s_evlog[s_evlogNext];
-    int n = snprintf(dst, sizeof(s_evlog[0]), "%7lus ", millis() / 1000);
-    vsnprintf(dst + n, sizeof(s_evlog[0]) - n, fmt, ap);
+    int n = snprintf(line, sizeof(line), "%7lus ", millis() / 1000);
+    vsnprintf(line + n, sizeof(line) - n, fmt, ap);
     va_end(ap);
+    portENTER_CRITICAL(&s_evlogMux);
+    memcpy(s_evlog[s_evlogNext], line, sizeof(line));
     s_evlogNext = (s_evlogNext + 1) % EVLOG_SIZE;
-    Serial.printf("[rtp] %s\n", dst);
+    portEXIT_CRITICAL(&s_evlogMux);
+    LogQueue::printf("[rtp] %s", line);
 }
 
 const char* const EXCEPTION_NAMES[] = {
@@ -170,18 +188,13 @@ void onException(const APPLEMIDI_NAMESPACE::ssrc_t&,
 constexpr uint32_t INVITE_RETRY_MS = 30000;
 
 void inviteTick() {
-    const Config::Values& c = Config::get();
-    if (c.targetIp.length() == 0 || s_peerCount > 0) return;
+    if (!s_hasTarget || s_peerCount > 0) return;
     uint32_t now = millis();
     if (s_lastInviteMs != 0 && now - s_lastInviteMs < INVITE_RETRY_MS) return;
     s_lastInviteMs = now;
-    IPAddress ip;
-    if (!ip.fromString(c.targetIp.c_str())) {
-        Serial.printf("[rtp] invalid peer IP in config: \"%s\"\n", c.targetIp.c_str());
-        return;
-    }
-    if (AppleMIDI.sendInvite(ip, c.targetPort)) {
-        Serial.printf("[rtp] inviting peer %s:%u\n", c.targetIp.c_str(), c.targetPort);
+    if (AppleMIDI.sendInvite(s_targetIp, s_targetPort)) {
+        LogQueue::printf("[rtp] inviting peer %u.%u.%u.%u:%u", s_targetIp[0], s_targetIp[1],
+                         s_targetIp[2], s_targetIp[3], s_targetPort);
     }
 }
 
@@ -223,7 +236,7 @@ void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& ssrc) {
 }
 
 // Incoming MIDI from the RTP peer, handed to the bridge (RTP -> USB).
-// These fire inside MIDI.read() in tick(), i.e. loop context.
+// These fire inside MIDI.read() in tick(), i.e. in the MIDI task.
 void onRxNoteOn(byte ch, byte note, byte vel) { MidiBridge::rtpNoteOn(ch, note, vel); }
 void onRxNoteOff(byte ch, byte note, byte vel) { MidiBridge::rtpNoteOff(ch, note, vel); }
 void onRxControlChange(byte ch, byte num, byte val) { MidiBridge::rtpControlChange(ch, num, val); }
@@ -249,9 +262,19 @@ void onRxActiveSensing() { MidiBridge::rtpRealTime(0xFE); }
 void onRxSystemReset() { MidiBridge::rtpRealTime(0xFF); }
 }  // namespace
 
+void RtpMidi::configure(const char* sessionName, const char* targetIp, uint16_t targetPort) {
+    snprintf(s_name, sizeof(s_name), "%s", sessionName);
+    s_targetPort = targetPort;
+    s_hasTarget = false;
+    if (targetIp[0]) {
+        s_hasTarget = s_targetIp.fromString(targetIp);
+        if (!s_hasTarget) Serial.printf("[rtp] invalid peer IP in config: \"%s\"\n", targetIp);
+    }
+}
+
 void RtpMidi::begin() {
     if (started) return;
-    AppleMIDI.setName(Config::get().sessionName.c_str());
+    AppleMIDI.setName(s_name);
     AppleMIDI.setHandleConnected(onPeerConnected);
     AppleMIDI.setHandleDisconnected(onPeerDisconnected);
     AppleMIDI.setHandleException(onException);
@@ -275,8 +298,7 @@ void RtpMidi::begin() {
     MIDI.setHandleSystemReset(onRxSystemReset);
     MIDI.begin(MIDI_CHANNEL_OMNI);
     started = true;
-    Serial.printf("[rtp] session \"%s\" listening on UDP 5004/5005\n",
-                  Config::get().sessionName.c_str());
+    LogQueue::printf("[rtp] session \"%s\" listening on UDP 5004/5005", s_name);
 }
 
 bool RtpMidi::isStarted() {
@@ -291,7 +313,7 @@ void RtpMidi::tick() {
     // At one read() per loop a busy MIDI host's display/fader stream keeps
     // the buffer full, CK0/CK1 sync starves, and the library ends the session
     // (BY) after MaxSynchronizationCK0Attempts (~60 s). The bound keeps a
-    // flood from starving WiFi/web handling in loop().
+    // flood from starving the USB->RTP half of the MIDI task's pass.
     //
     // read() returning false is NOT "nothing left" (1.7.2): it is also what
     // the MIDI library returns after handing over each 128-byte piece of a
@@ -312,6 +334,10 @@ bool RtpMidi::hasPeer() {
 
 int RtpMidi::peerCount() {
     return s_peerCount;
+}
+
+const char* RtpMidi::peerName(int i) {
+    return i >= 0 && i < s_peerCount ? s_peerName[i] : "";
 }
 
 void RtpMidi::sendNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
@@ -370,8 +396,14 @@ void RtpMidi::sendActiveSensing() {
 }
 
 void RtpMidi::appendEventLog(String& out, const char* sep) {
+    // Copy out under the lock, build the String outside it.
+    char copy[EVLOG_SIZE][EVLOG_LINE];
+    portENTER_CRITICAL(&s_evlogMux);
+    memcpy(copy, s_evlog, sizeof(copy));
+    const int next = s_evlogNext;
+    portEXIT_CRITICAL(&s_evlogMux);
     for (int i = 0; i < EVLOG_SIZE; i++) {
-        const char* line = s_evlog[(s_evlogNext + i) % EVLOG_SIZE];
+        const char* line = copy[(next + i) % EVLOG_SIZE];
         if (!line[0]) continue;
         out += line;
         out += sep;

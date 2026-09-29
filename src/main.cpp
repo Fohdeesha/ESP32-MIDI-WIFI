@@ -2,7 +2,8 @@
 
 #include "boot_guard.h"
 #include "config.h"
-#include "midi_bridge.h"
+#include "log_queue.h"
+#include "midi_task.h"
 #include "rtp_midi.h"
 #include "status_led.h"
 #include "usb_midi_host.h"
@@ -58,6 +59,7 @@ static void factoryResetTick() {
 
 void setup() {
     Serial.begin(115200);
+    LogQueue::begin();
     BootGuard::begin();
     delay(500);
     Serial.println();
@@ -69,28 +71,22 @@ void setup() {
     Config::load();
     WifiNet::begin(Config::get(), HOSTNAME);
     WebUi::begin();
-    MidiBridge::begin(Config::get().usbCable, Config::get().usbCableOut);
     UsbMidi::begin(Config::get().usbIface);
+    MidiTask::begin();
 }
 
-// Nothing in here may block. The USB->RTP path's latency is this loop's period,
-// and a host watchdog may allow as little as 2 s of silence -- so a stall here
-// is stuttering control, then a dropped session. Healthy: ~480 Hz, 2.1 ms mean.
+// Everything but MIDI (1.8.0). Forwarding runs in the MIDI task (midi_task.h)
+// at a higher priority, so a slow pass here -- a page load, a slow client, an
+// OTA upload, a burst of Serial output -- no longer delays MIDI. Until 1.8.0
+// this loop pumped MIDI too, and every HTTP request stalled both directions.
 void loop() {
     WifiNet::tick();
     ledTick();
     StatusLed::tick();
-
-    // AppleMIDI needs live sockets, so the session starts on first connect.
-    if (!RtpMidi::isStarted() && WifiNet::isConnected()) {
-        RtpMidi::begin();
-    }
-    RtpMidi::tick();
-    MidiBridge::tick();
-    MidiBridge::healthTick();
     WebUi::tick();
     BootGuard::tick();
     factoryResetTick();
+    LogQueue::drain();
 
     delay(1);
 }

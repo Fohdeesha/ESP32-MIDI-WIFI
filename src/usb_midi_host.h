@@ -4,6 +4,9 @@
 
 #include <cstdint>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 namespace UsbMidi {
 // One alternate setting of one MIDIStreaming interface, exactly as the
 // attached device presents it. inCables/outCables are bNumEmbMIDIJack from
@@ -27,11 +30,15 @@ struct IfaceInfo {
 // to claim on attach (Config::IFACE_AUTO = whichever MIDIStreaming interface
 // comes first); an absent one falls back to auto rather than not bridging.
 void begin(uint8_t preferredInterface);
-// Pops one 4-byte USB-MIDI event packet off the receive queue (and logs it
-// to serial + the web UI's event ring). Returns false when the queue is
-// empty. Call from loop context only.
+// Pops one 4-byte USB-MIDI event packet off the receive queue (and records it
+// in the web UI's event ring). Returns false when the queue is empty. MIDI
+// task only.
 bool readPacket(uint8_t out[4]);
+// The task to notify (xTaskNotifyGive) whenever IN packets are queued, so it
+// can block on its notification instead of polling. nullptr = none.
+void setRxNotify(TaskHandle_t task);
 // Queues one 4-byte USB-MIDI event packet for transmission to the device.
+// MIDI task only.
 // While the device is accepting packets, waits up to 20 ms for queue space
 // (burst backpressure); returns false when no device is attached, the queue
 // stayed full, or -- at once, without waiting -- the OUT side is stuck (a
@@ -52,9 +59,8 @@ bool deviceConnected();
 // gates the session health heartbeat -- the bridge must never claim a device
 // it cannot actually talk to is alive.
 bool healthy();
-const char* deviceName();  // product string of the attached device, "" if none
-const char* statusText();  // human-readable host state for the web UI
-uint32_t eventCount();     // MIDI events received since boot
+String statusText();    // human-readable host state for the web UI (a copy)
+uint32_t eventCount();  // MIDI events received since boot
 
 // --- MIDI function discovery (1.3.0), for the web UI's port picker ---------
 // Every MIDIStreaming interface found on the last attached device.
@@ -77,8 +83,9 @@ void appendRecentEvents(String& out, const char* sep);
 // outgoing packets can be read off the status page rather than assumed.
 void appendRecentTxEvents(String& out, const char* sep);
 uint32_t txFormattedCount();
-// Parsed + raw config descriptor of the last attached device ("" if none).
-const char* descriptorDump();
+// Parsed + raw config descriptor of the last attached device ("" if none), as
+// a copy: the client task rewrites it on every attach.
+String descriptorDump();
 // One-line IN-pipeline health: completed transfers, how many came back with a
 // FULL buffer (the device had data queued, i.e. it was accumulating between
 // polls), the worst submit->complete dwell, the worst complete->resubmit gap,
@@ -112,6 +119,10 @@ void appendPortDiag(String& out);
 // sep between entries -- how a failed enumeration explains itself.
 uint32_t stackLogCount();
 void appendStackLog(String& out, const char* sep);
+// Lowest free stack of the USB client task since boot, in bytes (0 = not
+// running). Its 4 kB now also carries the status-text and interface-list
+// publishing added in 1.8.0.
+uint32_t clientStackFree();
 // Zeroes both pipelines' diagnostic counters, so a measurement run describes
 // itself instead of being averaged against everything since boot. The running
 // totals the status page presents -- packets delivered, packets dropped, and
