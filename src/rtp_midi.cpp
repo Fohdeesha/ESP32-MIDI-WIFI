@@ -7,6 +7,7 @@
 #include "buffered_udp.h"
 #include "log_queue.h"
 #include "midi_bridge.h"
+#include "recorder.h"
 
 // tools/patch_applemidi.py fixes a set of AppleMIDI 3.3.0 bugs at build time
 // (a session the DAW opened never timing out, a lost OK locking a peer out,
@@ -170,10 +171,20 @@ struct ExLog {
 };
 ExLog s_exLog[EX_KINDS + 1];  // + one slot for codes this build has no name for
 
+// A SESSION record for the flight recorder: peers after the event, then the
+// exception number and the SSRC or exception value.
+void recordSession(uint8_t what, uint8_t exception, uint32_t value) {
+    uint8_t d[6] = {(uint8_t)s_peerCount, exception};
+    memcpy(d + 2, &value, 4);
+    Recorder::put(Recorder::SESSION, what, d, sizeof(d));
+}
+
 void onException(const APPLEMIDI_NAMESPACE::ssrc_t&,
                  const APPLEMIDI_NAMESPACE::Exception& e, const int32_t value) {
     const size_t kind = static_cast<size_t>(e) < EX_KINDS ? static_cast<size_t>(e) : EX_KINDS;
     const char* name = kind < EX_KINDS ? EXCEPTION_NAMES[kind] : "?";
+    // Every one, unlike the event ring's rate-limited lines.
+    recordSession(Recorder::SESSION_EXCEPTION, (uint8_t)static_cast<int>(e), (uint32_t)value);
     ExLog& ex = s_exLog[kind];
     ex.total++;
     s_evlogVersion++;
@@ -203,6 +214,7 @@ void inviteTick() {
     if (s_lastInviteMs != 0 && now - s_lastInviteMs < INVITE_RETRY_MS) return;
     s_lastInviteMs = now;
     if (AppleMIDI.sendInvite(s_targetIp, s_targetPort)) {
+        recordSession(Recorder::SESSION_INVITE, 0, (uint32_t)s_targetIp);
         LogQueue::printf("[rtp] inviting peer %u.%u.%u.%u:%u", s_targetIp[0], s_targetIp[1],
                          s_targetIp[2], s_targetIp[3], s_targetPort);
     }
@@ -212,6 +224,7 @@ void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& ssrc, const char* name) 
     int i = findPeer(ssrc);
     if (i >= 0) {
         // The peer re-sent its IN or OK: the session was already up.
+        recordSession(Recorder::SESSION_RECONNECTED, 0, ssrc);
         evlog("re-connected \"%s\" (peers %d)", s_peerName[i], s_peerCount);
         return;
     }
@@ -222,6 +235,7 @@ void onPeerConnected(const APPLEMIDI_NAMESPACE::ssrc_t& ssrc, const char* name) 
     // patch); never read past the field either way.
     snprintf(s_peerName[i], sizeof(s_peerName[i]), "%.*s", (int)PEER_NAME_LEN,
              (name && name[0]) ? name : "?");
+    recordSession(Recorder::SESSION_CONNECTED, 0, ssrc);
     evlog("connected \"%s\" (peers %d)", s_peerName[i], s_peerCount);
 }
 
@@ -238,6 +252,8 @@ void onPeerDisconnected(const APPLEMIDI_NAMESPACE::ssrc_t& ssrc) {
         s_peerSsrc[i] = s_peerSsrc[s_peerCount];
         memcpy(s_peerName[i], s_peerName[s_peerCount], sizeof(s_peerName[i]));
     }
+    recordSession(Recorder::SESSION_DISCONNECTED, 0, ssrc);
+    Recorder::trigger(Recorder::TRIG_SESSION);
     if (s_peerCount == 0) {
         // An orphaned surface must not keep showing the dead session's last
         // frame as if it were live -- dark is honest (1.2.0).
@@ -458,4 +474,8 @@ void RtpMidi::appendEventLog(String& out, const char* sep) {
 
 uint32_t RtpMidi::eventLogVersion() {
     return s_evlogVersion;
+}
+
+const char* RtpMidi::exceptionName(uint8_t code) {
+    return code < EX_KINDS ? EXCEPTION_NAMES[code] : "?";
 }

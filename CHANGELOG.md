@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.11.0
+
+- New flight recorder: every USB MIDI packet in both directions and every
+  session, USB, WiFi and web event, timed to the microsecond, in a 4 MB ring
+  in PSRAM (about 262 000 records).
+- It keeps recording for 10 s after a session drop, a heartbeat stop, a USB
+  port reset or a WiFi drop, then stops until re-armed, so what led up to the
+  problem is kept. Which of those stop it is a setting.
+- Download the last minute as text from the status page, or everything as a
+  raw file that `tools/decode_recorder.py` turns into text.
+- New endpoints `/api/recorder`, `/recorder.txt`, `/api/recorder/arm` and
+  `/api/recorder/freeze`, a status row, and a `recorder=` line in `/diag`.
+  The settings file gains `rtrig`.
+- The recent MIDI logs no longer format every packet as it passes.
+
 ## 1.10.0
 
 - Settings can be exported to a JSON file and imported again, under the new

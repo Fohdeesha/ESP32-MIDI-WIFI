@@ -28,4 +28,7 @@ void appendDiag(String& s);
 String eventLog();
 // Events recorded since boot: changes whenever eventLog() does, 0 = empty.
 uint32_t eventCount();
+// A disconnect reason code as the logs print it, "BEACON_TIMEOUT (200)" or
+// just the number. Any task.
+String reasonText(uint8_t reason);
 }  // namespace WifiNet

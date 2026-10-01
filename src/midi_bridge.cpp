@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "log_queue.h"
+#include "recorder.h"
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
 
@@ -169,11 +170,18 @@ void MidiBridge::tick() {
     // discarded straight away.
     if (peer && !uplinkReady(millis())) return;
     uint8_t p[4];
-    bool bridged = false;
+    uint32_t bridged = 0;  // packets that went into this pass's datagram
     for (int n = 0; n < USB_BATCH && UsbMidi::readPacket(p); n++) {
-        if (s_cable != Config::CABLE_ALL && (p[0] >> 4) != s_cable) continue;
-        if (!peer) continue;  // nobody to send to
-        bridged = true;
+        // The flight recorder gets every packet, with what became of it.
+        if (s_cable != Config::CABLE_ALL && (p[0] >> 4) != s_cable) {
+            Recorder::putPacket(Recorder::USB_IN, Recorder::IN_OTHER_CABLE, p);
+            continue;
+        }
+        if (!peer) {  // nobody to send to
+            Recorder::putPacket(Recorder::USB_IN, Recorder::IN_NO_PEER, p);
+            continue;
+        }
+        bool sent = true;  // false: a packet this bridge does not forward
         uint8_t ch = (p[1] & 0x0F) + 1;
         switch (p[0] & 0x0F) {
             case 0x8:
@@ -215,6 +223,8 @@ void MidiBridge::tick() {
                 } else if (p[1] == 0xF6) {  // tune request
                     RtpMidi::sendSystemCommon(0xF6, 0, 0);
                     s_forwarded++;
+                } else {
+                    sent = false;
                 }
                 break;
             // System Common and Real-Time (1.7.2): MIDI clock, transport and
@@ -224,6 +234,8 @@ void MidiBridge::tick() {
                 if (p[1] == 0xF1 || p[1] == 0xF2 || p[1] == 0xF3) {
                     RtpMidi::sendSystemCommon(p[1], p[2], p[3]);
                     s_forwarded++;
+                } else {
+                    sent = false;
                 }
                 break;
             case 0xF:  // 1 byte: real-time (a raw data byte is not parseable alone)
@@ -233,15 +245,22 @@ void MidiBridge::tick() {
                     p[1] == 0xFF) {
                     RtpMidi::sendRealTime(p[1]);
                     s_forwarded++;
+                } else {
+                    sent = false;
                 }
                 break;
             default:  // CIN 0x0/0x1: reserved
+                sent = false;
                 break;
         }
+        // A SysEx piece counts as sent: it went into the message being collected.
+        Recorder::putPacket(Recorder::USB_IN, sent ? Recorder::IN_FORWARDED : 0, p);
+        bridged++;
     }
     if (bridged) {
         s_upTokens--;
         s_upPackets++;
+        Recorder::put(Recorder::UPLINK, (uint8_t)(bridged < 255 ? bridged : 255), &s_upTokens, 1);
     }
 }
 
@@ -399,9 +418,15 @@ uint32_t MidiBridge::returnedCount() {
 
 namespace {
 constexpr uint32_t HEARTBEAT_MS = 250;
+// The flight recorder freezes when the heartbeat has stopped this long with a
+// peer connected (1.11.0).
+constexpr uint32_t HEARTBEAT_STOP_MS = 1000;
 uint32_t s_lastBeatMs = 0;
 bool s_lastDevState = false;
 bool s_lastPeerState = false;
+bool s_beatThisSession = false;  // a heartbeat has gone out to this peer
+bool s_stopTriggered = false;    // ...and its stop has fired the recorder
+uint32_t s_lastHeldRecMs = 0;    // last "held" record, one per HEARTBEAT_MS
 
 void sendDeviceMarker(bool attached) {
     // F0 7D "UMB" <state> F7 -- see the healthTick() contract in the header.
@@ -409,6 +434,7 @@ void sendDeviceMarker(bool attached) {
                                0x42, attached ? (uint8_t)0x01 : (uint8_t)0x00,
                                0xF7};
     RtpMidi::sendSysEx(marker, sizeof(marker));
+    Recorder::put(Recorder::MARKER, attached ? 1 : 0);
     LogQueue::printf("[health] device %s marker sent", attached ? "attached" : "detached");
 }
 }  // namespace
@@ -434,15 +460,41 @@ void MidiBridge::healthTick() {
     s_lastDevState = dev;
     s_lastPeerState = peer;
 
-    if (!peer) return;
+    if (!peer) {
+        s_beatThisSession = false;
+        s_stopTriggered = false;
+        return;
+    }
     const uint32_t now = millis();
     if (now - s_lastBeatMs < HEARTBEAT_MS) return;
     // The heartbeat is GATED on device health, not merely on attachment: it
     // must stop the moment the bridge can no longer vouch for the device
     // (IN pipeline dead, OUT transfers unACKed), so the host's watchdog trips.
-    if (UsbMidi::healthy()) {
+    const uint8_t why = UsbMidi::healthReason();
+    if (why == 0) {
+        // Late but healthy: the MIDI task itself was held up (USB
+        // backpressure across a long SysEx, say). On the wire that is the
+        // same stop, so it freezes the recorder too.
+        if (s_beatThisSession && !s_stopTriggered && now - s_lastBeatMs > HEARTBEAT_STOP_MS) {
+            Recorder::trigger(Recorder::TRIG_HEARTBEAT);
+        }
         s_lastBeatMs = now;
         RtpMidi::sendActiveSensing();
+        Recorder::put(Recorder::HEARTBEAT, 0);
+        s_beatThisSession = true;
+        s_stopTriggered = false;
+        return;
+    }
+    // Held: once per HEARTBEAT_MS in the recorder, not on every pass.
+    if (now - s_lastHeldRecMs >= HEARTBEAT_MS) {
+        s_lastHeldRecMs = now;
+        Recorder::put(Recorder::HEARTBEAT, why);
+    }
+    // A heartbeat that stopped, not one that never started (a session opened
+    // with no device attached is not a glitch to freeze for).
+    if (s_beatThisSession && !s_stopTriggered && now - s_lastBeatMs > HEARTBEAT_STOP_MS) {
+        s_stopTriggered = true;
+        Recorder::trigger(Recorder::TRIG_HEARTBEAT);
     }
 }
 

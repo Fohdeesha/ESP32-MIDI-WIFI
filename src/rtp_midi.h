@@ -5,9 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 
-// Everything here but hasPeer(), peerCount(), appendEventLog() and
-// eventLogVersion() belongs to the MIDI task (see midi_task.h for the
-// ownership rules).
+// Everything here but hasPeer(), peerCount(), appendEventLog(),
+// eventLogVersion() and exceptionName() belongs to the MIDI task (see
+// midi_task.h for the ownership rules).
 namespace RtpMidi {
 constexpr int MAX_PEERS = 2;           // the library's participant limit
 constexpr size_t PEER_NAME_LEN = 24;   // ...and its session-name limit
@@ -56,4 +56,7 @@ void appendEventLog(String& out, const char* sep);
 // Changes whenever appendEventLog()'s output does; 0 while it is empty. Lets
 // the web page fetch the log only when there is something new. Any task.
 uint32_t eventLogVersion();
+// The AppleMIDI library's name for an exception number ("?" if unknown).
+// Any task.
+const char* exceptionName(uint8_t code);
 }  // namespace RtpMidi

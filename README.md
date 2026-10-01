@@ -24,6 +24,7 @@ both ways, so LEDs, motor faders and displays on control surfaces work too.
   page
 - Settings export to a file and import again, to back up a board or set up
   another one
+- A flight recorder that keeps the moments before a dropout
 
 ## Hardware
 
@@ -66,8 +67,9 @@ curl -u admin:<password> -F "fw=@ESP32-MIDI-WIFI-<version>.bin" http://esp32-mid
    `http://esp32-midi.local/`.
 
 Everything else is on the same page: session name, a peer to invite (leave it
-blank to just accept invites), which USB MIDI port to use, static IP, TX power
-and the web password. Saving reboots the board.
+blank to just accept invites), which USB MIDI port to use, static IP, which
+events stop the flight recorder, TX power and the web password. Saving reboots
+the board.
 
 Export saves all of it as a JSON file, passwords included, so keep that file
 private. Import loads one back and reboots. Settings a file leaves out keep
@@ -75,6 +77,14 @@ their current values. The keys are the config form's field names.
 
 To wipe all settings (a forgotten password, a bad static IP), hold the BOOT
 button for 10 seconds while it's running.
+
+## Flight recorder
+
+The board logs every MIDI packet in both directions and every session, USB
+and WiFi event, with microsecond times. After a session drop, the heartbeat
+stopping, a USB reset or a WiFi drop it records 10 more seconds and stops, so
+the lead-up is kept until you re-arm it. Download it from the status page;
+`tools/decode_recorder.py` turns the raw file into text.
 
 ## Building
 

@@ -31,6 +31,9 @@
 //  5. No Serial in the MIDI task: a UART write blocks at wire rate (the 1.5.0
 //     stall). Use LogQueue::printf(), which loop() drains.
 //  6. Settings change only through save and reboot.
+//  7. The flight recorder (recorder.h, 1.11.0) is the exception to all of
+//     this: any task may write it (Recorder::put, trigger), under its own
+//     spinlock, without blocking.
 namespace MidiTask {
 struct Snapshot {
     uint32_t published;  // snapshots so far; 0 = none yet

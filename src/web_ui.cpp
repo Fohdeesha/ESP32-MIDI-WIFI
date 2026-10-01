@@ -3,7 +3,10 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <errno.h>
 #include <esp_mac.h>
+#include <esp_timer.h>
+#include <lwip/sockets.h>
 
 #include "boot_guard.h"
 #include "buffered_udp.h"
@@ -11,6 +14,7 @@
 #include "log_queue.h"
 #include "midi_bridge.h"
 #include "midi_task.h"
+#include "recorder.h"
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
 // Generated from web/index.html by tools/embed_web.py, under the build dir.
@@ -322,6 +326,15 @@ bool txPowerValue(const String& s, uint8_t& out) {
     return true;
 }
 
+// The flight recorder's freeze triggers (1.11.0): a bitmask, the page's four
+// checkboxes.
+bool recTriggerValue(const String& s, uint8_t& out) {
+    uint32_t v;
+    if (!decimalValue(s, Config::REC_TRIGGERS_ALL, v)) return false;
+    out = (uint8_t)v;
+    return true;
+}
+
 // The static IP block, checked as a whole since each field constrains the
 // others. Trims all four and fills in the default mask first. A bad value that
 // slipped into NVS would only surface as an unreachable device.
@@ -511,6 +524,37 @@ String macText() {
     return s;
 }
 
+// The flight recorder's state for its status row (1.11.0).
+String recorderText() {
+    Recorder::Status st;
+    Recorder::status(st);
+    if (!st.enabled) return "off (no memory for it)";
+    char t[200];
+    const char* mem = st.psram ? "" : ", internal RAM only";
+    const uint64_t held = st.oldest ? st.seq - st.oldest + 1 : 0;
+    if (st.frozen) {
+        snprintf(t, sizeof(t), "frozen: %s at %.1f s; holds %.1f-%.1f s (%lu records)%s",
+                 Recorder::triggerName(st.trigger), st.triggerUs / 1e6, st.oldestUs / 1e6,
+                 st.freezeUs / 1e6, (unsigned long)held, mem);
+        return t;
+    }
+    const uint64_t now = esp_timer_get_time();
+    if (st.trigger != Recorder::TRIG_NONE) {
+        snprintf(t, sizeof(t), "%s at %.1f s, freezing in %.0f s%s",
+                 Recorder::triggerName(st.trigger), st.triggerUs / 1e6,
+                 st.freezeUs > now ? (st.freezeUs - now) / 1e6 : 0.0, mem);
+        return t;
+    }
+    const double span = st.oldest && now > st.oldestUs ? (now - st.oldestUs) / 1e6 : 0;
+    char spanText[24];
+    if (span < 120) snprintf(spanText, sizeof(spanText), "%.0f s", span);
+    else if (span < 7200) snprintf(spanText, sizeof(spanText), "%.1f min", span / 60);
+    else snprintf(spanText, sizeof(spanText), "%.1f h", span / 3600);
+    snprintf(t, sizeof(t), "recording, last %s (%lu records, %lu/s)%s", spanText,
+             (unsigned long)held, (unsigned long)st.perSec, mem);
+    return t;
+}
+
 // The page: static, gzipped, from flash. no-cache makes the browser revalidate
 // on every load, and the ETag (a hash of the page) turns that into a 304, so a
 // reload costs a few hundred bytes of airtime instead of the whole page.
@@ -625,6 +669,8 @@ void handleApiStatus() {
              (unsigned long)snap.periodMaxUs, (unsigned long)snap.stackFree);
     j.key("task");
     j.str(t);
+    j.key("rec");
+    j.str(recorderText());
     snprintf(t, sizeof(t), "%lu s", (unsigned long)(millis() / 1000));
     j.key("uptime");
     j.str(t);
@@ -689,6 +735,8 @@ void handleApiConfig() {
     j.unum(c.usbCableOut);
     j.key("txp");
     j.unum(c.txPower);
+    j.key("rtrig");
+    j.unum(c.recTriggers);
     j.key("txChoices");
     j.openArr();
     for (uint8_t choice : Config::TX_POWER_CHOICES) j.unum(choice);
@@ -919,6 +967,10 @@ void handleConfigPost() {
         server.send(400, "text/html", "Not saved: invalid WiFi TX power.");
         return;
     }
+    if (server.hasArg("rtrig") && !recTriggerValue(server.arg("rtrig"), v.recTriggers)) {
+        server.send(400, "text/html", "Not saved: invalid flight recorder triggers.");
+        return;
+    }
     if (server.hasArg("clearpass") && server.arg("clearpass") == "1") {
         v.webPass = "";
     } else if (webpass.length()) {
@@ -986,6 +1038,8 @@ void handleExport() {
     j.unum(c.usbCableOut);
     j.key("txp");
     j.unum(c.txPower);
+    j.key("rtrig");
+    j.unum(c.recTriggers);
     textSetting(j, "webpass", c.webPass);
     j.close();
     if (!j.ok()) {
@@ -1190,6 +1244,7 @@ const ByteKey BYTE_KEYS[] = {
     {"ucab", &Config::Values::usbCable, cableInValue},
     {"ucabo", &Config::Values::usbCableOut, cableOutValue},
     {"txp", &Config::Values::txPower, txPowerValue},
+    {"rtrig", &Config::Values::recTriggers, recTriggerValue},
 };
 
 // Applies a settings file to v. A setting the file leaves out keeps its
@@ -1477,7 +1532,7 @@ void handleRebootPost() {
     ESP.restart();
 }
 
-// Plain text for measurement scripts, about 1.2 kB, cheap enough to sample
+// Plain text for measurement scripts, about 1.4 kB, cheap enough to sample
 // once a second during a load ramp without becoming part of the experiment.
 // The traffic counters are single-writer 32-bit values read live rather than
 // from the 100 ms snapshot, since the scripts diff them; the midi_task= line
@@ -1486,7 +1541,7 @@ void handleRebootPost() {
 void handleDiag() {
     if (!authOk()) return server.requestAuthentication();
     String s;
-    s.reserve(1536);
+    s.reserve(1792);
     s += "fw=" FW_VERSION "\nuptime_s=";
     s += String(millis() / 1000);
     s += "\nrssi=";
@@ -1564,6 +1619,23 @@ void handleDiag() {
                  BufferedUDP::taskRunning() ? 1 : 0);
         s += buf;
     }
+    {
+        // 1.11.0: the flight recorder. trigger= is what froze it, or is about
+        // to (none while recording normally).
+        static const char* const TRIGGER_TOKENS[] = {"none",     "session", "heartbeat",
+                                                     "usb_reset", "wifi",   "manual"};
+        Recorder::Status st;
+        Recorder::status(st);
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+                 "\nrecorder=seq=%llu oldest=%llu frozen=%d trigger=%s records_per_s=%lu "
+                 "capacity=%lu refused=%lu psram=%d",
+                 (unsigned long long)st.seq, (unsigned long long)st.oldest, st.frozen ? 1 : 0,
+                 st.trigger <= Recorder::TRIG_MANUAL ? TRIGGER_TOKENS[st.trigger] : "?",
+                 (unsigned long)st.perSec, (unsigned long)st.capacity,
+                 (unsigned long)st.refused, st.psram ? 1 : 0);
+        s += buf;
+    }
     s += "\n";
     server.send(200, "text/plain", s);
 }
@@ -1590,32 +1662,318 @@ void handleResetPost() {
     delay(300);
     ESP.restart();
 }
+
+// ── Flight recorder downloads (1.11.0, recorder.h) ──────────────────────────
+// Both stream in chunks from s_json and stop at the record that was newest
+// when the download began, so a ring that keeps recording is not chased. They
+// run in the loop task, which stalls nothing but the web page, WiFi upkeep
+// and the LED -- so not through WebServer's own writes: those wait up to 10 s
+// per call for a client that stopped reading (WiFiClient::write retries a 1 s
+// select ten times, and starts over whenever a byte gets through), which a
+// laptop shut mid-download could repeat past the loop's 30 s watchdog.
+// Download writes straight to the socket: no progress for STALL_MS, or the
+// whole download past MAX_MS, ends it. The chunked encoding is then left
+// unfinished, so the client reports an incomplete download instead of saving
+// a short file as if it were whole.
+class Download {
+public:
+    static constexpr uint32_t STALL_MS = 3000;
+    static constexpr uint32_t MAX_MS = 60000;
+
+    // Sends the status line and headers; the body follows in chunk() calls.
+    Download(const char* type, const char* ext)
+        : client_(server.client()), fd_(client_.fd()), startMs_(millis()) {
+        uint8_t m[6] = {};
+        esp_read_mac(m, ESP_MAC_WIFI_STA);
+        char head[320];
+        const int n = snprintf(head, sizeof(head),
+                               "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
+                               "Content-Disposition: attachment; "
+                               "filename=\"esp32-midi-recorder-%02x%02x%02x.%s\"\r\n"
+                               "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                               "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                               type, m[3], m[4], m[5], ext);
+        write(head, n < (int)sizeof(head) ? n : sizeof(head) - 1);
+    }
+    bool ok() const { return ok_; }
+    bool chunk(const char* p, size_t len) {
+        if (!len) return ok_;
+        char size[12];
+        const int n = snprintf(size, sizeof(size), "%x\r\n", (unsigned)len);
+        return write(size, n) && write(p, len) && write("\r\n", 2);
+    }
+    void finish() { write("0\r\n\r\n", 5); }
+
+private:
+    bool write(const char* p, size_t len) {
+        uint32_t last = millis();
+        while (ok_ && len) {
+            const uint32_t now = millis();
+            if (fd_ < 0 || now - startMs_ > MAX_MS || now - last > STALL_MS) {
+                ok_ = false;
+                break;
+            }
+            fd_set w;
+            FD_ZERO(&w);
+            FD_SET(fd_, &w);
+            timeval tv = {0, 50000};
+            const int r = select(fd_ + 1, nullptr, &w, nullptr, &tv);
+            if (r < 0) {
+                ok_ = false;
+                break;
+            }
+            if (r == 0) continue;
+            const int sent = send(fd_, p, len, MSG_DONTWAIT);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                ok_ = false;
+                break;
+            }
+            p += sent;
+            len -= sent;
+            last = millis();
+            // Progress, bounded by MAX_MS: past the loop's 30 s only while
+            // the client is actually taking the data.
+            BootGuard::feedWatchdog();
+        }
+        return ok_;
+    }
+    WiFiClient client_;  // keeps the socket ours while we write to it
+    int fd_;
+    uint32_t startMs_;
+    bool ok_ = true;
+};
+
+// Downloads take the write checks (a Host this device is known by), since a
+// page on another site could otherwise start one with the browser's cached
+// login and spend the radio and the loop task on it. No sendHeader() here:
+// headers queued that way would ride along on the next request's response,
+// as these handlers write their own.
+bool downloadAllowed() {
+    if (!authOk()) {
+        server.requestAuthentication();
+        return false;
+    }
+    if (!hostOk() || server.header("Sec-Fetch-Site") == "cross-site") {
+        server.send(403, "text/plain",
+                    String("Refused: to download the recorder, open this page as http://") +
+                        WifiNet::hostname() + ".local/ or by the device's IP address.");
+        return false;
+    }
+    return true;
+}
+
+// A whole number argument, or the default; false (after a 400) if malformed.
+bool countArg(const char* name, uint64_t dflt, uint64_t& out) {
+    out = dflt;
+    if (!server.hasArg(name)) return true;
+    const String& a = server.arg(name);
+    if (!allDigits(a) || a.length() > 18) {
+        server.send(400, "text/plain", String("invalid ") + name);
+        return false;
+    }
+    out = strtoull(a.c_str(), nullptr, 10);
+    return true;
+}
+
+// Raw records, the format in recorder.h, for tools/decode_recorder.py.
+// ?since=<seq> starts later than the oldest record held, ?max=<n> sends fewer.
+void handleRecorderRaw() {
+    if (!downloadAllowed()) return;
+    Recorder::Status st;
+    Recorder::status(st);
+    if (!st.enabled || !st.oldest) {
+        server.send(503, "text/plain", "the flight recorder holds nothing (no memory for it?)");
+        return;
+    }
+    uint64_t since, max;
+    if (!countArg("since", 0, since) || !countArg("max", UINT64_MAX, max)) return;
+    uint64_t from = since > st.oldest ? since : st.oldest;
+    uint64_t end = st.seq + 1;  // exclusive
+    if (from > end) from = end;
+    if (max < end - from) end = from + max;
+    // The first record's full time goes in the header: the decoder's anchor
+    // until the file's first BOOT, TIME, FREEZE or ARM record.
+    uint64_t firstUs = 0;
+    {
+        Recorder::Rec r;
+        uint64_t after, lost;
+        if (from < end && Recorder::read(from, &r, 1, after, lost) == 1) {
+            from = after - 1;  // later if it was overwritten meanwhile
+            firstUs = Recorder::fullTime(r, from);
+        }
+    }
+    Download dl("application/octet-stream", "bin");
+    uint8_t* b = reinterpret_cast<uint8_t*>(s_json);
+    const uint32_t version = 1, size = sizeof(Recorder::Rec), first = (uint32_t)from;
+    const uint64_t now = esp_timer_get_time();
+    memcpy(b, "ESPMREC1", 8);
+    memcpy(b + 8, &version, 4);
+    memcpy(b + 12, &size, 4);
+    memcpy(b + 16, &first, 4);
+    memcpy(b + 20, &st.capacity, 4);
+    memcpy(b + 24, &now, 8);
+    memcpy(b + 32, &firstUs, 8);
+    dl.chunk(s_json, 40);
+    Recorder::Rec* recs = reinterpret_cast<Recorder::Rec*>(s_json);
+    const size_t cap = sizeof(s_json) / sizeof(Recorder::Rec);
+    uint64_t next = from;
+    while (next < end && dl.ok()) {
+        size_t n = 0;
+        while (n < cap && next < end) {
+            uint64_t after, lost;
+            size_t want = cap - n < 64 ? cap - n : 64;
+            if (end - next < want) want = (size_t)(end - next);
+            size_t got = Recorder::read(next, recs + n, want, after, lost);
+            if (!got) {
+                next = end;
+                break;
+            }
+            if (after > end) {  // overwritten meanwhile: the copy started later
+                const uint64_t extra = after - end;
+                got = extra < got ? got - (size_t)extra : 0;
+                after = end;
+            }
+            n += got;
+            next = after;
+        }
+        if (!n) break;
+        dl.chunk(s_json, n * sizeof(Recorder::Rec));
+    }
+    if (dl.ok()) dl.finish();
+}
+
+// The last ?seconds=<n> (1-3600, default 60) as text, one line per record:
+// what tools/decode_recorder.py prints for the raw file.
+void handleRecorderText() {
+    if (!downloadAllowed()) return;
+    Recorder::Status st;
+    Recorder::status(st);
+    if (!st.enabled || !st.oldest) {
+        server.send(503, "text/plain", "the flight recorder holds nothing (no memory for it?)");
+        return;
+    }
+    uint64_t seconds;
+    if (!countArg("seconds", 60, seconds)) return;
+    if (seconds < 1) seconds = 1;
+    if (seconds > 3600) seconds = 3600;
+    // While frozen, "the last n seconds" are the ones before it froze.
+    const uint64_t endUs = st.frozen ? st.freezeUs : (uint64_t)esp_timer_get_time();
+    const uint64_t startUs = endUs > seconds * 1000000 ? endUs - seconds * 1000000 : 0;
+    uint64_t next = Recorder::seqAt(startUs) + 1;
+    if (next < st.oldest) next = st.oldest;
+    const uint64_t end = st.seq + 1;
+    Download dl("text/plain; charset=utf-8", "txt");
+    Recorder::Rec recs[32];
+    size_t used = 0;
+    while (next < end && dl.ok()) {
+        uint64_t after, lost;
+        size_t want = end - next < 32 ? (size_t)(end - next) : 32;
+        const size_t got = Recorder::read(next, recs, want, after, lost);
+        if (!got) break;
+        if (lost) {
+            used += snprintf(s_json + used, sizeof(s_json) - used, "... %llu records lost\n",
+                             (unsigned long long)lost);
+        }
+        const uint64_t firstSeq = after - got;
+        for (size_t i = 0; i < got && firstSeq + i < end; i++) {
+            const uint64_t seq = firstSeq + i;
+            used += Recorder::format(recs[i], Recorder::fullTime(recs[i], seq), s_json + used,
+                                     sizeof(s_json) - used - 1);
+            s_json[used++] = '\n';
+            if (used > sizeof(s_json) - 160) {
+                dl.chunk(s_json, used);
+                used = 0;
+            }
+        }
+        next = after;
+    }
+    dl.chunk(s_json, used);
+    if (dl.ok()) dl.finish();
+}
+
+void handleRecorderArm() {
+    if (!authOk()) return server.requestAuthentication();
+    if (refuseCrossOrigin()) return;
+    Recorder::arm();
+    server.send(200, "text/plain", "recording\n");
+}
+
+void handleRecorderFreeze() {
+    if (!authOk()) return server.requestAuthentication();
+    if (refuseCrossOrigin()) return;
+    Recorder::trigger(Recorder::TRIG_MANUAL);
+    server.send(200, "text/plain", "frozen\n");
+}
+
+// Which page the request this tick() handled was, for the recorder's WEB
+// record; 0xFF = none.
+uint8_t s_webPath = 0xFF;
+
+// server.on() that also tells the recorder which page ran.
+void route(const char* uri, HTTPMethod method, uint8_t id, WebServer::THandlerFunction fn) {
+    server.on(uri, method, [id, fn]() {
+        s_webPath = id;
+        fn();
+    });
+}
+
+void route(const char* uri, HTTPMethod method, uint8_t id, WebServer::THandlerFunction fn,
+           WebServer::THandlerFunction upload) {
+    server.on(
+        uri, method,
+        [id, fn]() {
+            s_webPath = id;
+            fn();
+        },
+        [id, upload]() {
+            s_webPath = id;  // an upload that never reaches its handler counts too
+            upload();
+        });
+}
 }  // namespace
 
 void WebUi::begin() {
     // Authorization is always collected. Origin is what sameOrigin() checks;
-    // the other two serve the page (gzip, and the ETag revalidation).
-    static const char* HEADERS[] = {"Origin", "Accept-Encoding", "If-None-Match"};
-    server.collectHeaders(HEADERS, 3);
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/api/status", HTTP_GET, handleApiStatus);
-    server.on("/api/config", HTTP_GET, handleApiConfig);
-    server.on("/api/log", HTTP_GET, handleApiLog);
-    server.on("/api/scan", HTTP_GET, handleApiScanGet);
-    server.on("/api/scan", HTTP_POST, handleApiScanPost);
-    server.on("/config", HTTP_POST, handleConfigPost);
-    server.on("/config/export", HTTP_GET, handleExport);
-    server.on("/config/import", HTTP_POST, handleImportPost, handleImportUpload);
-    server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
-    server.on("/reset", HTTP_POST, handleResetPost);
-    server.on("/reboot", HTTP_POST, handleRebootPost);
-    server.on("/diag", HTTP_GET, handleDiag);
-    server.on("/diagreset", HTTP_POST, handleDiagReset);
-    server.onNotFound([]() { server.send(404, "text/plain", "not found"); });
+    // the next two serve the page (gzip, and the ETag revalidation).
+    // Sec-Fetch-Site lets the recorder downloads refuse another site's page.
+    static const char* HEADERS[] = {"Origin", "Accept-Encoding", "If-None-Match", "Sec-Fetch-Site"};
+    server.collectHeaders(HEADERS, 4);
+    using namespace Recorder;
+    route("/", HTTP_GET, WEB_ROOT, handleRoot);
+    route("/api/status", HTTP_GET, WEB_API_STATUS, handleApiStatus);
+    route("/api/config", HTTP_GET, WEB_API_CONFIG, handleApiConfig);
+    route("/api/log", HTTP_GET, WEB_API_LOG, handleApiLog);
+    route("/api/scan", HTTP_GET, WEB_API_SCAN, handleApiScanGet);
+    route("/api/scan", HTTP_POST, WEB_API_SCAN, handleApiScanPost);
+    route("/api/recorder", HTTP_GET, WEB_RECORDER, handleRecorderRaw);
+    route("/api/recorder/arm", HTTP_POST, WEB_RECORDER_CTL, handleRecorderArm);
+    route("/api/recorder/freeze", HTTP_POST, WEB_RECORDER_CTL, handleRecorderFreeze);
+    route("/recorder.txt", HTTP_GET, WEB_RECORDER_TXT, handleRecorderText);
+    route("/config", HTTP_POST, WEB_CONFIG, handleConfigPost);
+    route("/config/export", HTTP_GET, WEB_EXPORT, handleExport);
+    route("/config/import", HTTP_POST, WEB_IMPORT, handleImportPost, handleImportUpload);
+    route("/update", HTTP_POST, WEB_UPDATE, handleUpdatePost, handleUpdateUpload);
+    route("/reset", HTTP_POST, WEB_RESET, handleResetPost);
+    route("/reboot", HTTP_POST, WEB_REBOOT, handleRebootPost);
+    route("/diag", HTTP_GET, WEB_DIAG, handleDiag);
+    route("/diagreset", HTTP_POST, WEB_DIAGRESET, handleDiagReset);
+    server.onNotFound([]() {
+        s_webPath = WEB_OTHER;
+        server.send(404, "text/plain", "not found");
+    });
     server.begin();
     Serial.println("[web] config UI on http://esp32-midi.local/");
 }
 
 void WebUi::tick() {
+    // One request at most per call; its whole time here, upload included,
+    // goes in the flight recorder, to line page loads up against glitches.
+    s_webPath = 0xFF;
+    const uint32_t startUs = micros();
     server.handleClient();
+    if (s_webPath != 0xFF) {
+        const uint32_t us = micros() - startUs;
+        Recorder::put(Recorder::WEB, s_webPath, &us, 4);
+    }
 }

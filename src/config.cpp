@@ -29,6 +29,7 @@ void readStored(Config::Values& v) {
     v.usbCable = prefs.getUChar("ucab", 0);
     v.usbCableOut = prefs.getUChar("ucabo", Config::CABLE_SAME);
     v.txPower = prefs.getUChar("txp", Config::TX_POWER_DEFAULT);
+    v.recTriggers = prefs.getUChar("rtrig", Config::REC_TRIGGERS_ALL);
 }
 
 void writeAll(const Config::Values& v) {
@@ -46,6 +47,7 @@ void writeAll(const Config::Values& v) {
     prefs.putUChar("ucab", v.usbCable);
     prefs.putUChar("ucabo", v.usbCableOut);
     prefs.putUChar("txp", v.txPower);
+    prefs.putUChar("rtrig", v.recTriggers);
 }
 
 bool sameSettings(const Config::Values& a, const Config::Values& b) {
@@ -55,7 +57,8 @@ bool sameSettings(const Config::Values& a, const Config::Values& b) {
            a.staticIp == b.staticIp && a.staticMask == b.staticMask &&
            a.staticGw == b.staticGw && a.staticDns == b.staticDns &&
            a.usbIface == b.usbIface && a.usbCable == b.usbCable &&
-           a.usbCableOut == b.usbCableOut && a.txPower == b.txPower;
+           a.usbCableOut == b.usbCableOut && a.txPower == b.txPower &&
+           a.recTriggers == b.recTriggers;
 }
 }  // namespace
 
@@ -71,6 +74,7 @@ void Config::load() {
     // loads as the default, not the nearest choice: those versions stored
     // 19.5 dBm whenever the config page was saved with the field untouched.
     if (!txPowerValid(values.txPower)) values.txPower = TX_POWER_DEFAULT;
+    values.recTriggers &= REC_TRIGGERS_ALL;
 }
 
 bool Config::save(const Values& v) {

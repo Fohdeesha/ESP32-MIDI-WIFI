@@ -17,6 +17,7 @@ button.alt{background:#333;color:#ddd}button.alt:hover{background:#444}button.al
 .warn{color:#fa5}small{color:#888}
 /* The browser's default link blue is unreadable on #111. */
 a{color:#8cf}
+.checks label{display:inline-block;margin:.1em 1.4em .2em 0;color:#ddd}
 .nets{margin:.5em 0;border:1px solid #333;border-radius:4px;padding:.2em .6em}
 .nets summary{cursor:pointer;color:#8cf;padding:.3em 0}
 .nets table{width:100%;border-collapse:collapse;margin:.2em 0 .4em}
@@ -46,6 +47,7 @@ a{color:#8cf}
 <tr><td>IN pipeline</td><td id='s-in'></td></tr>
 <tr><td>OUT pipeline</td><td id='s-out'></td></tr>
 <tr><td>MIDI task</td><td id='s-task'></td></tr>
+<tr><td>Flight recorder</td><td id='s-rec'></td></tr>
 <tr><td>Uptime</td><td id='s-uptime'></td></tr>
 <tr><td>Free heap</td><td id='s-heap'></td></tr>
 </table>
@@ -55,6 +57,9 @@ a{color:#8cf}
 <details class='nets' id='l-wifi' hidden><summary>WiFi events</summary><pre></pre></details>
 <details class='nets' id='l-stack' hidden><summary>USB host stack errors</summary><small>logged by the ESP-IDF USB driver; E (n) = n ms after boot</small><pre></pre></details>
 <details class='nets' id='l-desc' hidden><summary>USB descriptors</summary><pre></pre></details>
+<details class='nets' id='rec'><summary>Flight recorder</summary><small>Every USB MIDI packet in both directions and every session, USB and WiFi event, timed to the microsecond. After a session drop, a heartbeat stop, a USB port reset or a WiFi drop it records 10 s more and then stops, so what led up to it is kept until you re-arm it. Pick those triggers under Configuration.</small>
+<p><a href='/recorder.txt?seconds=60'>Last minute as text</a> &middot; <a href='/api/recorder'>Everything, raw</a> <small>(read it with tools/decode_recorder.py; a download is a lot of WiFi traffic, so not while the bridge is busy)</small></p>
+<div class='btnrow'><button type='button' class='alt' id='r-freeze'>Freeze now</button><button type='button' class='alt' id='r-arm'>Re-arm</button></div></details>
 <h2>Configuration</h2><form method='POST' action='/config' autocomplete='off'>
 <label>WiFi SSID <small>(type, or pick from available networks below)</small></label><input type='text' name='ssid' autocomplete='off' value=''><input type='hidden' name='ssidhex' value='' disabled>
 <div id='nets'></div>
@@ -75,6 +80,7 @@ a{color:#8cf}
 <label>Gateway <small>(blank = none)</small></label><input type='text' name='sgw' value=''>
 <label>DNS server <small>(blank = use gateway)</small></label><input type='text' name='sdns' value=''>
 <p><small class='warn'>A wrong static IP can make the device unreachable (no setup-AP fallback once WiFi itself connects). Recovery: hold BOOT for 10&nbsp;s to factory-reset.</small></p>
+<label>Flight recorder stops 10 s after</label><div class='checks'><label><input type='checkbox' data-bit='1'> a session drop</label><label><input type='checkbox' data-bit='2'> the heartbeat stopping</label><label><input type='checkbox' data-bit='4'> a USB port reset</label><label><input type='checkbox' data-bit='8'> a WiFi drop</label></div><input type='hidden' name='rtrig' value=''>
 <label>WiFi TX power</label><select name='txp'></select>
 <p><small>Power above ~8.5 dBm has been shown to cause brownouts on some ESP32 boards. Use with caution.</small></p>
 <label>Web UI password <small id='c-wpass'></small></label><input type='password' name='webpass' maxlength='63' value=''>
@@ -287,6 +293,12 @@ async function loadConfig() {
              c.txp);
   $('c-wpass').textContent = c.webPassSet ? '(set; blank = keep current)'
                                           : '(not set; blank = stays off)';
+  // The recorder's triggers: one checkbox per bit of rtrig, each set only if
+  // still untouched, like the text fields above.
+  for (const cb of form.querySelectorAll('[data-bit]')) {
+    if (cb.checked === cb.defaultChecked) cb.checked = !!(c.rtrig & cb.dataset.bit);
+  }
+  syncTriggers();
   $('c-bridging').textContent = c.bridging;
   $('c-warn').firstChild.textContent = c.warning;
   $('c-warn').hidden = !c.warning;
@@ -302,6 +314,26 @@ form.addEventListener('submit', e => {
           'with blanks. Reload the page and try again.');
   }
 });
+
+function syncTriggers() {
+  let mask = 0;
+  for (const cb of form.querySelectorAll('[data-bit]')) if (cb.checked) mask |= +cb.dataset.bit;
+  field('rtrig').value = mask;
+}
+form.querySelectorAll('[data-bit]').forEach(cb => cb.addEventListener('change', syncTriggers));
+
+// --- Flight recorder -------------------------------------------------------------
+async function recorder(action) {
+  try {
+    await request('/api/recorder/' + action, {method: 'POST'});
+    problem('rec', '');
+  } catch (e) {
+    problem('rec', 'The recorder did not ' + action + '. ' + why(e));
+  }
+  tick();  // the status row shows the result
+}
+$('r-freeze').addEventListener('click', () => recorder('freeze'));
+$('r-arm').addEventListener('click', () => recorder('arm'));
 
 // The device refuses a settings file over 4 kB; a bigger one is the wrong file,
 // so say so here rather than send it.

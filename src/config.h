@@ -32,6 +32,9 @@ struct Values {
     // out the board's USB-serial chip). Only values in TX_POWER_CHOICES are
     // accepted.
     uint8_t txPower;
+    // Which events freeze the flight recorder (1.11.0): a bit per
+    // Recorder::Trigger, bit (1 << (trigger - 1)); all four by default.
+    uint8_t recTriggers;
 };
 
 constexpr uint8_t IFACE_AUTO = 0xFF;
@@ -45,6 +48,7 @@ inline bool txPowerValid(uint8_t v) {
         if (v == c) return true;
     return false;
 }
+constexpr uint8_t REC_TRIGGERS_ALL = 0x0F;  // session, heartbeat, USB reset, WiFi
 
 // Loads NVS-stored values; anything unset gets a safe default (no baked-in
 // credentials -- a blank config boots into the setup AP portal).

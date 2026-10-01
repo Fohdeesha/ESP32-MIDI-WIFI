@@ -4,6 +4,7 @@
 #include "config.h"
 #include "log_queue.h"
 #include "midi_task.h"
+#include "recorder.h"
 #include "rtp_midi.h"
 #include "status_led.h"
 #include "usb_midi_host.h"
@@ -69,6 +70,8 @@ void setup() {
     pinMode(RESET_BTN_PIN, INPUT_PULLUP);
     StatusLed::begin();
     Config::load();
+    // Before anything it records starts (1.11.0).
+    Recorder::begin(Config::get().recTriggers);
     WifiNet::begin(Config::get(), HOSTNAME);
     WebUi::begin();
     UsbMidi::begin(Config::get().usbIface);
@@ -86,6 +89,7 @@ void loop() {
     WebUi::tick();
     BootGuard::tick();
     factoryResetTick();
+    Recorder::tick();
     LogQueue::drain();
 
     delay(1);

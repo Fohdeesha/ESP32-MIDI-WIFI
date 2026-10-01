@@ -5,6 +5,8 @@
 #include <esp_system.h>
 #include <esp_wifi.h>
 
+#include "recorder.h"
+
 namespace {
 const char* s_hostname = "esp32-midi";
 bool mdnsUp = false;
@@ -68,6 +70,12 @@ bool s_retryPending = false;
 uint32_t s_retryCount = 0;
 uint32_t s_upSinceMs = 0;
 
+// A WIFI record for the flight recorder: data[0] = reason, data[1] = RSSI.
+void recordWifi(uint8_t what, uint8_t reason, int8_t rssi) {
+    const uint8_t d[2] = {reason, (uint8_t)rssi};
+    Recorder::put(Recorder::WIFI, what, d, 2);
+}
+
 void recordEv(uint8_t kind, uint8_t reason) {
     const WifiEv e = {(uint32_t)(millis() / 1000), kind, reason, s_lastRssi};
     portENTER_CRITICAL(&s_evMux);
@@ -96,7 +104,7 @@ const char* reasonName(uint8_t r) {
     }
 }
 
-String reasonText(uint8_t r) {
+String reasonLabel(uint8_t r) {
     const char* n = reasonName(r);
     if (n) return String(n) + " (" + String(r) + ")";
     return String(r);
@@ -199,12 +207,14 @@ void onWifiEvent(WiFiEvent_t event, arduino_event_info_t info) {
             s_lastRssi = WiFi.RSSI();
             s_staUp = true;
             recordEv(1, 0);
+            recordWifi(Recorder::WIFI_GOT_IP, 0, s_lastRssi);
             Serial.printf("[net] connected, IP %s (RSSI %d dBm, TX %.1f dBm)\n",
                           WiFi.localIP().toString().c_str(), WiFi.RSSI(),
                           Config::get().txPower / 4.0);
             break;
         case ARDUINO_EVENT_WIFI_STA_LOST_IP:
             s_staUp = false;
+            recordWifi(Recorder::WIFI_LOST_IP, 0, s_lastRssi);
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
             // The reason code is the single most diagnostic byte a dropout
@@ -212,6 +222,7 @@ void onWifiEvent(WiFiEvent_t event, arduino_event_info_t info) {
             // the AP vanished or changed channel, AUTH_/ASSOC_FAIL = AP-side
             // refusal. Log it, count it, remember it.
             const uint8_t r = info.wifi_sta_disconnected.reason;
+            const bool wasUp = s_staUp;
             s_staUp = false;
             s_discCount++;
             s_lastReason = r;
@@ -219,8 +230,12 @@ void onWifiEvent(WiFiEvent_t event, arduino_event_info_t info) {
             // the core's one-off retry at boot), not a failure to act on.
             if (r != WIFI_REASON_ASSOC_LEAVE) s_failEvents++;
             recordEv(0, r);
+            recordWifi(Recorder::WIFI_DISCONNECTED, r, s_lastRssi);
+            // A link that was up and went down, not a failed attempt to join
+            // or this station's own leave: worth freezing the recorder for.
+            if (wasUp && r != WIFI_REASON_ASSOC_LEAVE) Recorder::trigger(Recorder::TRIG_WIFI);
             Serial.printf("[net] station DISCONNECTED, reason %s (disconnect #%lu, last RSSI %d dBm)\n",
-                          reasonText(r).c_str(), (unsigned long)s_discCount, s_lastRssi);
+                          reasonLabel(r).c_str(), (unsigned long)s_discCount, s_lastRssi);
             break;
         }
         default:
@@ -276,6 +291,7 @@ void WifiNet::tick() {
         if (now - s_lastRssiMs > 2000) {
             s_lastRssiMs = now;
             s_lastRssi = WiFi.RSSI();
+            recordWifi(Recorder::WIFI_RSSI, 0, s_lastRssi);
         }
         return;
     }
@@ -291,6 +307,7 @@ void WifiNet::tick() {
     if (s_retryPending && (int32_t)(now - s_retryAtMs) >= 0) {
         s_retryPending = false;
         s_retryCount++;
+        recordWifi(Recorder::WIFI_RETRY, 0, s_lastRssi);
         if (esp_wifi_connect() != ESP_OK) scheduleRetry(now);
     }
     // RECONNECT KICK (1.7.0): the safety net under the retries above, for an
@@ -302,6 +319,7 @@ void WifiNet::tick() {
         s_lastKickMs = now;
         s_kickCount++;
         recordEv(2, 0);
+        recordWifi(Recorder::WIFI_KICK, 0, s_lastRssi);
         Serial.printf("[net] still disconnected -- forcing reconnect (kick #%lu)\n",
                       (unsigned long)s_kickCount);
         WiFi.reconnect();
@@ -359,7 +377,7 @@ void WifiNet::appendDiag(String& s) {
     s += " kicks=";
     s += String(s_kickCount);
     s += " last_reason=";
-    s += s_discCount ? reasonText(s_lastReason) : String("-");
+    s += s_discCount ? reasonLabel(s_lastReason) : String("-");
     s += " reset=";
     s += resetReasonName();
     s += " txpwr_dbm=";
@@ -382,7 +400,7 @@ String WifiNet::eventLog() {
         } else if (e.kind == 2) {
             out += "reconnect kick";
         } else {
-            out += "DISCONNECTED reason " + reasonText(e.reason);
+            out += "DISCONNECTED reason " + reasonLabel(e.reason);
         }
         out += " (last RSSI " + String(e.rssi) + " dBm)\n";
     }
@@ -391,4 +409,8 @@ String WifiNet::eventLog() {
 
 uint32_t WifiNet::eventCount() {
     return s_evCount;  // an aligned 32-bit read: no lock needed
+}
+
+String WifiNet::reasonText(uint8_t reason) {
+    return reasonLabel(reason);
 }

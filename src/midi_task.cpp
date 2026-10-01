@@ -6,6 +6,7 @@
 #include "buffered_udp.h"
 #include "config.h"
 #include "midi_bridge.h"
+#include "recorder.h"
 #include "usb_midi_host.h"
 #include "wifi_net.h"
 
@@ -21,6 +22,7 @@ constexpr uint32_t SNAPSHOT_MS = 100;
 // spinning task would otherwise starve loop() without anything noticing.
 constexpr int MAX_BUSY_PASSES = 50;
 constexpr uint32_t BLOCKED_US = 50;  // a wait shorter than this did not block
+constexpr uint32_t TASK_RECORD_US = 5000;  // passes longer go in the flight recorder
 
 TaskHandle_t s_task = nullptr;
 
@@ -146,6 +148,12 @@ void run(void*) {
         const uint32_t pass = micros() - startUs;
         const uint32_t period = startUs - lastStartUs;
         lastStartUs = startUs;
+        if (pass > TASK_RECORD_US) {  // a long pass, lined up with what caused it
+            uint8_t d[5];
+            memcpy(d, &pass, 4);
+            d[4] = (uint8_t)(msgs < 255 ? msgs : 255);
+            Recorder::put(Recorder::TASK, 0, d, sizeof(d));
+        }
         if (pass > s_passMaxUs) {
             s_passMaxUs = pass;
             s_passMaxAtMs = millis();

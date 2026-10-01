@@ -9,6 +9,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "hal/usb_dwc_ll.h"
+#include "recorder.h"
 #include "soc/usb_dwc_struct.h"
 #include "usb/usb_host.h"
 
@@ -486,6 +487,8 @@ void onTransferDone(usb_transfer_t* xfer) {
     } else {
         s_rxErrors++;
         if (isEpError(xfer->status)) noteEpError();
+        const uint8_t st = (uint8_t)xfer->status;
+        Recorder::put(Recorder::USB_STATE, Recorder::USB_RX_ERROR, &st, 1);
     }
     // Out of the active set -- healthy() sees the pipeline shrink -- until the
     // client pass has cleared the pipe and resubmitted it (recoverRx), or
@@ -511,7 +514,10 @@ void recoverRx(uint32_t now) {
     for (bool p : s_rxParked) any |= p;
     if (!any || !s_connected || now - s_rxRetryMs < epRetryGapMs()) return;
     s_rxRetryMs = now;
-    if (usb_host_endpoint_clear(s_device, s_epIn) == ESP_OK) s_epClears++;
+    if (usb_host_endpoint_clear(s_device, s_epIn) == ESP_OK) {
+        s_epClears++;
+        Recorder::put(Recorder::USB_STATE, Recorder::USB_EP_CLEAR, &s_epIn, 1);
+    }
     for (int i = 0; i < NUM_RX_TRANSFERS; i++) {
         if (!s_rxParked[i] || !s_xfers[i]) continue;
         if (usb_host_transfer_submit(s_xfers[i]) != ESP_OK) break;  // still refused
@@ -533,7 +539,10 @@ void serviceTx() {
         const uint32_t now = millis();
         if (now - s_txRetryMs < epRetryGapMs()) return;
         s_txRetryMs = now;
-        if (usb_host_endpoint_clear(s_device, s_epOut) == ESP_OK) s_epClears++;
+        if (usb_host_endpoint_clear(s_device, s_epOut) == ESP_OK) {
+            s_epClears++;
+            Recorder::put(Recorder::USB_STATE, Recorder::USB_EP_CLEAR, &s_epOut, 1);
+        }
         s_txHalted = false;  // the submit below says whether that was enough
     }
     // A submit the pipe refused keeps its packets, in order, for next time --
@@ -587,6 +596,10 @@ void onTxDone(usb_transfer_t* xfer) {
     s_txLost += lost;
     s_txLostWindow += lost;
     s_txErrors++;
+    {
+        const uint8_t d[2] = {(uint8_t)xfer->status, (uint8_t)(lost < 255 ? lost : 255)};
+        Recorder::put(Recorder::USB_STATE, Recorder::USB_TX_ERROR, d, 2);
+    }
     if (xfer->status != USB_TRANSFER_STATUS_NO_DEVICE) {
         if (isEpError(xfer->status)) noteEpError();
         s_txHalted = true;  // an error halts the pipe; serviceTx clears it
@@ -872,10 +885,17 @@ void attachDevice(uint8_t addr) {
                   "(%u/%u cables declared) -- listening\n",
                   s_ifaceNum, s_ifaceAlt, s_epIn, s_epOut, s_ifaceList[pick].inCables,
                   s_ifaceList[pick].outCables);
+    {
+        const uint16_t vid = dd ? dd->idVendor : 0, pid = dd ? dd->idProduct : 0;
+        const uint8_t d[5] = {(uint8_t)vid, (uint8_t)(vid >> 8), (uint8_t)pid,
+                              (uint8_t)(pid >> 8), s_ifaceNum};
+        Recorder::put(Recorder::USB_STATE, Recorder::USB_ATTACH, d, 5);
+    }
 }
 
 void detachDevice() {
     s_connected = false;
+    Recorder::put(Recorder::USB_STATE, Recorder::USB_DETACH);
     // Let in-flight transfers drain (they complete with NO_DEVICE) before
     // releasing -- their callbacks arrive through handle_events.
     for (int i = 0; i < 20 && s_inFlight > 0; i++) {
@@ -987,6 +1007,7 @@ void enumWatchdog() {
     s_portState = PORT_UNENUMERATED;
     injectPortError();
     s_enumRetries++;
+    Recorder::put(Recorder::USB_STATE, Recorder::USB_ENUM_RETRY);
     s_lastRetryMs = now;
     if (s_retryStreak < 255) s_retryStreak++;
     Serial.printf("[usb] device on the port but not enumerated for %lu ms -- retrying (#%lu)\n",
@@ -1010,10 +1031,12 @@ void escalate(uint32_t now) {
     }
     if (!s_connected) return;
     const char* why = nullptr;
+    uint8_t cause = 1;  // for the flight recorder: 1 errors persist, 2 TX wedged
     const uint32_t sub = s_txSubmitMs;
     if (s_resetWanted) {
         why = "USB errors persist";
     } else if (sub && (int32_t)(now - sub) > (int32_t)TX_WEDGE_RESET_MS) {
+        cause = 2;
         // Signed: a submit stamped after `now` was read is 0 ms old, not
         // 4.3e9 -- read unsigned, that difference reset a healthy device's
         // port whenever the millisecond ticked over mid-pass.
@@ -1039,6 +1062,8 @@ void escalate(uint32_t now) {
     s_lastTroubleMs = now;
     if (s_resetStreak < 255) s_resetStreak++;
     s_portResets++;
+    Recorder::put(Recorder::USB_STATE, Recorder::USB_PORT_RESET, &cause, 1);
+    Recorder::trigger(Recorder::TRIG_USB_RESET);
     injectPortError();
     Serial.printf("[usb] %s -- resetting the device's port (#%lu)\n", why,
                   (unsigned long)s_portResets);
@@ -1078,39 +1103,52 @@ void daemonTask(void*) {
     }
 }
 
-// Recent decoded events, kept for the web UI (serial may be unplugged when
-// the board is deployed at the instrument). Written by the MIDI task
-// (readPacket), read by the web server: a line is formatted outside the lock
-// and only copied in under it, and readers copy the ring out the same way.
+// Recent events, kept for the web UI (serial may be unplugged when the board
+// is deployed at the instrument). Written by the MIDI task (readPacket), read
+// by the web server under s_ringMux. Since 1.11.0 the rings hold the raw
+// 4-byte packets and readers format them: the per-packet snprintf is off the
+// forwarding path, and the flight recorder (recorder.h) holds the long history.
 constexpr int LOG_RING = 12;
 constexpr size_t LOG_LINE = 48;
-char s_ring[LOG_RING][LOG_LINE];
+MidiPacket s_ring[LOG_RING];
 uint32_t s_eventCount = 0;
 // Same ring for the device-bound direction: with a configurable cable the
 // nibble actually stamped on outgoing packets has to be observable, not just
 // assumed. Written by the MIDI task too (writePacket), like the RX ring.
-char s_txRing[LOG_RING][LOG_LINE];
+MidiPacket s_txRing[LOG_RING];
 uint32_t s_txFormatted = 0;
 portMUX_TYPE s_ringMux = portMUX_INITIALIZER_UNLOCKED;
 
-void ringPut(char (*ring)[LOG_LINE], uint32_t& count, const char* line) {
+// Whether a packet belongs in the recent-events logs: not MIDI clock or Active
+// Sensing (they would push everything else out within a second) or a
+// reserved CIN.
+bool shown(const MidiPacket& p) {
+    const uint8_t cin = p.b[0] & 0x0F;
+    if (cin < 0x2) return false;
+    return !(cin == 0xF && (p.b[1] == 0xF8 || p.b[1] == 0xFE));
+}
+
+void ringPut(MidiPacket* ring, uint32_t& count, const MidiPacket& p) {
     portENTER_CRITICAL(&s_ringMux);
-    memcpy(ring[count % LOG_RING], line, LOG_LINE);
+    ring[count % LOG_RING] = p;
     count++;
     portEXIT_CRITICAL(&s_ringMux);
 }
 
-void ringAppend(const char (*ring)[LOG_LINE], const uint32_t& count, String& out,
-                const char* sep) {
-    char copy[LOG_RING][LOG_LINE];
+bool formatPacket(const MidiPacket& p, char* buf, size_t len);
+
+void ringAppend(const MidiPacket* ring, const uint32_t& count, String& out, const char* sep) {
+    MidiPacket copy[LOG_RING];
     portENTER_CRITICAL(&s_ringMux);
     memcpy(copy, ring, sizeof(copy));
     const uint32_t total = count;
     portEXIT_CRITICAL(&s_ringMux);
     const uint32_t n = total < LOG_RING ? total : LOG_RING;
+    char line[LOG_LINE];
     for (uint32_t i = 0; i < n; i++) {  // oldest first
         if (i) out += sep;
-        out += copy[(total - n + i) % LOG_RING];
+        formatPacket(copy[(total - n + i) % LOG_RING], line, sizeof(line));
+        out += line;
     }
 }
 
@@ -1226,9 +1264,10 @@ bool UsbMidi::readPacket(uint8_t out[4]) {
     // (_txBufferSize = 0), so every printf blocks at wire rate once the
     // 128-byte FIFO fills -- ~2 ms per event at 115200. A moving fader emits
     // >100 events/s, so the log alone cost ~25% of the loop. The web status
-    // page's event ring is the diagnostic, and it is free.
-    char line[LOG_LINE];
-    if (formatPacket(pkt, line, sizeof(line))) ringPut(s_ring, s_eventCount, line);
+    // page's event ring is the diagnostic, and it is free. (The flight
+    // recorder's USB_IN record is written by MidiBridge::tick(), which knows
+    // what became of the packet.)
+    if (shown(pkt)) ringPut(s_ring, s_eventCount, pkt);
     memcpy(out, pkt.b, 4);
     return true;
 }
@@ -1238,7 +1277,12 @@ void UsbMidi::setRxNotify(TaskHandle_t task) {
 }
 
 bool UsbMidi::writePacket(const uint8_t pkt[4]) {
-    if (!s_connected || !s_epOut || !s_txQueue) return false;
+    if (!s_connected || !s_epOut || !s_txQueue) {
+        // Nothing to send to (a replug, a port reset): the recorder still
+        // shows what was lost.
+        Recorder::putPacket(Recorder::USB_OUT, 0, pkt);
+        return false;
+    }
     // Brief backpressure instead of an instant drop: a packet lost mid-sysex
     // desyncs the P1-M's display parser, and the client task drains the queue
     // continuously (a full-speed bulk transfer carries 16 packets per ms), so
@@ -1252,8 +1296,12 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
     if (xQueueSend(s_txQueue, pkt, stuck ? 0 : pdMS_TO_TICKS(20)) != pdTRUE) {
         s_txDropped++;
         s_txDropWindow++;
+        Recorder::putPacket(Recorder::USB_OUT, 0, pkt);
         return false;
     }
+    // What actually went toward the device (1.11.0), the view that settled
+    // the 1.6.3 velocity-0 bug.
+    Recorder::putPacket(Recorder::USB_OUT, Recorder::OUT_QUEUED, pkt);
     // Producer-side backlog. Rising above a handful means the device is not
     // draining as fast as the network is filling -- the earliest warning that
     // the offered rate has passed what this surface can absorb, and it appears
@@ -1264,8 +1312,7 @@ bool UsbMidi::writePacket(const uint8_t pkt[4]) {
     }
     MidiPacket rec;
     memcpy(rec.b, pkt, 4);
-    char line[LOG_LINE];
-    if (formatPacket(rec, line, sizeof(line))) ringPut(s_txRing, s_txFormatted, line);
+    if (shown(rec)) ringPut(s_txRing, s_txFormatted, rec);
     usb_host_client_unblock(s_client);  // wake the client task to send now
     return true;
 }
@@ -1283,15 +1330,32 @@ bool UsbMidi::deviceConnected() {
 }
 
 bool UsbMidi::healthy() {
-    if (!s_connected || s_resetPending) return false;
+    return healthReason() == 0;
+}
+
+uint8_t UsbMidi::healthReason() {
+    if (!s_connected) return 1;
+    if (s_resetPending) return 2;
     // Only meaningful when the claimed function can receive at all: an
     // OUT-only device has no IN pipeline to judge, and demanding one would
     // permanently suppress the heartbeat for it.
-    if (s_epIn && s_rxActive <= 0) return false;  // IN pipeline errored idle: deaf device
-    if (s_txHalted) return false;  // OUT pipe errored; recovery not through yet
+    if (s_epIn && s_rxActive <= 0) return 3;  // IN pipeline errored idle: deaf device
+    if (s_txHalted) return 4;  // OUT pipe errored; recovery not through yet
     const uint32_t sub = s_txSubmitMs;
-    if (sub != 0 && millis() - sub > 2000) return false;  // OUT unACKed: wedged
-    return true;
+    if (sub != 0 && millis() - sub > 2000) return 5;  // OUT unACKed: wedged
+    return 0;
+}
+
+const char* UsbMidi::healthReasonName(uint8_t reason) {
+    switch (reason) {
+        case 0: return "healthy";
+        case 1: return "no device";
+        case 2: return "port reset pending";
+        case 3: return "IN pipeline dead";
+        case 4: return "OUT pipe halted";
+        case 5: return "OUT transfer unacknowledged over 2 s";
+        default: return "?";
+    }
 }
 
 uint8_t UsbMidi::ifaceCount() {

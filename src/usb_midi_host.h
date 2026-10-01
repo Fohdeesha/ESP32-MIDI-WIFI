@@ -59,6 +59,11 @@ bool deviceConnected();
 // gates the session health heartbeat -- the bridge must never claim a device
 // it cannot actually talk to is alive.
 bool healthy();
+// Why healthy() is false, in the order it checks (1.11.0, for the flight
+// recorder): 0 healthy, 1 no device, 2 port reset pending, 3 IN pipeline
+// dead, 4 OUT pipe halted, 5 an OUT transfer unacknowledged over 2 s.
+uint8_t healthReason();
+const char* healthReasonName(uint8_t reason);
 String statusText();    // human-readable host state for the web UI (a copy)
 // MIDI events received since boot that the recent-events log shows: MIDI
 // clock (F8), Active Sensing (FE) and reserved packets are left out.
