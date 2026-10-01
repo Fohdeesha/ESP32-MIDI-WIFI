@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.0
+
+- The web page is now a static file that loads its data as JSON, so the device
+  no longer builds the page on every load, and a reload costs almost nothing.
+  It looks the same and keeps every setting, row and log.
+- Status and any open log update every 2 s while the page is visible.
+- New MAC address row on the status page, and `mac=` in `/diag`.
+- The network list fills in by itself when a scan finishes.
+- The page is UTF-8. A name an older version stored in another encoding is
+  left as it is when you save, and a network with such a name can still be
+  picked from the list.
+- New endpoints: `/api/status`, `/api/config`, `/api/log` and `/api/scan`.
+
 ## 1.8.0
 
 - MIDI runs in its own task, above the web server. Loading the page or a slow

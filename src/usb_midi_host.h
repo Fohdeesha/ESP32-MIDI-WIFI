@@ -86,6 +86,8 @@ uint32_t txFormattedCount();
 // Parsed + raw config descriptor of the last attached device ("" if none), as
 // a copy: the client task rewrites it on every attach.
 String descriptorDump();
+// Changes whenever descriptorDump() does; 0 while it is empty.
+uint32_t descriptorVersion();
 // One-line IN-pipeline health: completed transfers, how many came back with a
 // FULL buffer (the device had data queued, i.e. it was accumulating between
 // polls), the worst submit->complete dwell, the worst complete->resubmit gap,

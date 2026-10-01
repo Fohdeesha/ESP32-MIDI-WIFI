@@ -26,4 +26,6 @@ void appendDiag(String& s);
 // Recent WiFi events (connects/disconnects with uptime stamp, reason and last
 // known RSSI), newest last, one per line. Empty string when nothing happened.
 String eventLog();
+// Events recorded since boot: changes whenever eventLog() does, 0 = empty.
+uint32_t eventCount();
 }  // namespace WifiNet

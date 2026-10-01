@@ -13,7 +13,7 @@ both ways, so LEDs, motor faders and displays on control surfaces work too.
 
 - Works with class-compliant USB MIDI devices, in both directions, including
   long SysEx, clock and timecode
-- Web page for setup, status and diagnostics at `http://esp32-midi.local/`
+- Web page for setup, live status and diagnostics at `http://esp32-midi.local/`
 - Accepts session invites, or invites a peer you set
 - Choose which of the device's MIDI ports to bridge, or merge them all
 - Firmware updates over WiFi, with automatic rollback if a new build keeps
@@ -84,6 +84,9 @@ The build patches the AppleMIDI library first (`tools/patch_applemidi.py`). Its
 only release has a few bugs that matter here, the worst being a debug print on
 every SysEx byte that stalls everything. The script fails the build if the
 library ever changes, so it can't quietly ship unpatched.
+
+The web page is `web/index.html`. The build gzips it into the firmware
+(`tools/embed_web.py`), and it gets its data from the device as JSON.
 
 ## Changelog
 

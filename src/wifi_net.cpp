@@ -388,3 +388,7 @@ String WifiNet::eventLog() {
     }
     return out;
 }
+
+uint32_t WifiNet::eventCount() {
+    return s_evCount;  // an aligned 32-bit read: no lock needed
+}

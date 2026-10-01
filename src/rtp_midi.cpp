@@ -118,6 +118,9 @@ constexpr size_t EVLOG_LINE = 64;
 char s_evlog[EVLOG_SIZE][EVLOG_LINE];
 int s_evlogNext = 0;
 portMUX_TYPE s_evlogMux = portMUX_INITIALIZER_UNLOCKED;
+// Bumped on every new line and every exception (the per-kind totals under the
+// ring change even when the rate limit holds a line back). MIDI task only.
+volatile uint32_t s_evlogVersion = 0;
 
 void evlog(const char* fmt, ...) {
     char line[EVLOG_LINE];
@@ -130,6 +133,7 @@ void evlog(const char* fmt, ...) {
     memcpy(s_evlog[s_evlogNext], line, sizeof(line));
     s_evlogNext = (s_evlogNext + 1) % EVLOG_SIZE;
     portEXIT_CRITICAL(&s_evlogMux);
+    s_evlogVersion++;
     LogQueue::printf("[rtp] %s", line);
 }
 
@@ -167,6 +171,7 @@ void onException(const APPLEMIDI_NAMESPACE::ssrc_t&,
     const char* name = kind < EX_KINDS ? EXCEPTION_NAMES[kind] : "?";
     ExLog& ex = s_exLog[kind];
     ex.total++;
+    s_evlogVersion++;
     const uint32_t now = millis();
     if (ex.seen && now - ex.lastMs < EX_LOG_GAP_MS) {
         ex.heldBack++;
@@ -419,4 +424,8 @@ void RtpMidi::appendEventLog(String& out, const char* sep) {
         any = true;
     }
     if (any) out += sep;
+}
+
+uint32_t RtpMidi::eventLogVersion() {
+    return s_evlogVersion;
 }

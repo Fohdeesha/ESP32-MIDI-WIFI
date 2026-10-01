@@ -3,6 +3,7 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_mac.h>
 
 #include "boot_guard.h"
 #include "config.h"
@@ -11,10 +12,18 @@
 #include "midi_task.h"
 #include "rtp_midi.h"
 #include "usb_midi_host.h"
+// Generated from web/index.html by tools/embed_web.py, under the build dir.
+#include "web_page.h"
 #include "wifi_net.h"
 
 // Runs in the loop task, below the MIDI task: MIDI state comes from
 // MidiTask::snapshot() or a module's locked copy, per midi_task.h.
+//
+// The page itself is static (web/index.html, served from flash) and fills
+// itself from small JSON documents (1.9.0). Until then the device built ~14 kB
+// of HTML per load with String appends; now a load is a flash-to-socket copy,
+// or a 304 once the browser has it, and the status JSON is ~1.5 kB formatted
+// into one static buffer.
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.0.0-dev"
@@ -30,456 +39,6 @@ bool authOk() {
     const String& p = Config::get().webPass;
     if (p.length() == 0) return true;
     return server.authenticate("admin", p.c_str());
-}
-
-const char PAGE_HEAD[] PROGMEM = R"html(<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-MIDI-WIFI</title><style>
-body{font-family:system-ui,sans-serif;max-width:640px;margin:1em auto;padding:0 1em;background:#111;color:#ddd}
-h1{font-size:1.4em;color:#e0453a}h2{font-size:1.05em;margin-top:1.6em;border-bottom:1px solid #333;padding-bottom:.3em}
-table{border-collapse:collapse}td{padding:.15em .8em .15em 0;color:#aaa}td+td{color:#ddd}
-label{display:block;margin:.7em 0 .2em;color:#aaa}
-input[type=text],input[type=password],input[type=number],select{width:100%;box-sizing:border-box;padding:.45em;background:#222;border:1px solid #444;border-radius:4px;color:#ddd}
-/* White on #e0453a is 4.1:1 -- AA only as large text, hence 1.2em/700. */
-button{margin-top:1em;padding:.5em 1.4em;background:#e0453a;border:0;border-radius:4px;color:#fff;font-size:1.2em;font-weight:700;cursor:pointer}
-button:hover{background:#f2564a}button:active{background:#c53a30}
-/* Secondary action sharing a row with a primary one (#ddd on #333 is 9.2:1). */
-button.alt{background:#333;color:#ddd}button.alt:hover{background:#444}button.alt:active{background:#2a2a2a}
-.btnrow{display:flex;gap:.7em;flex-wrap:wrap;align-items:center}
-.warn{color:#fa5}small{color:#888}
-.nets{margin:.5em 0;border:1px solid #333;border-radius:4px;padding:.2em .6em}
-.nets summary{cursor:pointer;color:#8cf;padding:.3em 0}
-.nets table{width:100%;border-collapse:collapse;margin:.2em 0 .4em}
-.nets tr{cursor:pointer}
-.nets tr:hover td{background:#222}
-.nets td{padding:.35em .6em;border-bottom:1px solid #2a2a2a;color:#ddd}
-.nets td.rssi{text-align:right;color:#888;white-space:nowrap;width:6em}
-.nets pre{font-size:1em;line-height:1.35;margin:.4em 0 .6em;overflow-x:auto}
-.nets small{display:block;margin:.3em 0 .1em}
-.foot{margin-top:2.2em;border-top:1px solid #333;padding-top:.8em;color:#888;font-size:.9em}
-.foot a{color:#e0453a;text-decoration:none}.foot a:hover{text-decoration:underline}
-</style></head><body><h1>ESP32-MIDI-WIFI</h1>
-)html";
-
-String htmlEscape(const String& in);
-
-// Cables are numbered 0-15 on the wire but every host UI labels the same
-// things "port 1..16", so the page shows both and never just one.
-String portLabel(uint8_t cable) {
-    return "port " + String(cable + 1) + " (cable " + String(cable) + ")";
-}
-
-String bridgedPortText() {
-    uint8_t in = MidiBridge::bridgedCable();
-    String s = in == Config::CABLE_ALL ? String("all ports merged") : portLabel(in);
-    return s + " in, " + portLabel(MidiBridge::outputCable()) + " out";
-}
-
-// Flags a selection pointing at a cable the attached device doesn't declare in
-// that direction -- the asymmetric case (a device's in and out cable counts are
-// independent) that would otherwise be silently dead in one direction.
-String portWarning() {
-    UsbMidi::IfaceInfo f;
-    if (!UsbMidi::claimedInterfaceInfo(f)) return String();
-    String w;
-    uint8_t in = MidiBridge::bridgedCable();
-    uint8_t out = MidiBridge::outputCable();
-    if (f.inCables && in != Config::CABLE_ALL && in >= f.inCables) {
-        w += "The device declares only " + String(f.inCables) +
-             " port(s) toward the network, so nothing will arrive on " + portLabel(in) + ". ";
-    }
-    if (f.outCables && out >= f.outCables) {
-        w += "The device declares only " + String(f.outCables) +
-             " port(s) from the network, so anything sent to " + portLabel(out) +
-             " will be ignored. ";
-    }
-    return w;
-}
-
-String statusSection() {
-    MidiTask::Snapshot snap;
-    MidiTask::snapshot(snap);
-    String s = F("<h2>Status</h2><table>");
-    s += "<tr><td>Firmware</td><td>v" FW_VERSION "</td></tr>";
-    s += "<tr><td>IP</td><td>" + WiFi.localIP().toString() +
-         (WifiNet::usingStaticIp() ? " (static)" : " (DHCP)") + "</td></tr>";
-    s += "<tr><td>RSSI</td><td>" + String(WiFi.RSSI()) + " dBm (TX " +
-         String(Config::get().txPower / 4.0, 1) + " dBm)</td></tr>";
-    {
-        // WiFi health (1.7.0): a dropout used to be invisible here -- the page
-        // read "good RSSI" while the device had been off the network for
-        // minutes. Disconnect count + last reason + reset reason answer the
-        // "why did it drop?" question from the device itself.
-        String w;
-        WifiNet::appendDiag(w);
-        s += "<tr><td>WiFi health</td><td>" + htmlEscape(w) + "</td></tr>";
-    }
-    String peers = String(snap.peerCount);
-    if (Config::get().targetIp.length() && snap.peerCount == 0) {
-        peers += " (inviting " + htmlEscape(Config::get().targetIp) + ":" +
-                 String(Config::get().targetPort) + ")";
-    }
-    const int named = snap.peerCount < RtpMidi::MAX_PEERS ? snap.peerCount : RtpMidi::MAX_PEERS;
-    for (int i = 0; i < named; i++) {
-        peers += i ? ", " : " (";
-        peers += htmlEscape(snap.peerNames[i]);
-    }
-    if (named > 0) peers += ")";
-    s += "<tr><td>RTP-MIDI peers</td><td>" + peers + "</td></tr>";
-    s += "<tr><td>USB MIDI</td><td>" + htmlEscape(UsbMidi::statusText()) + "</td></tr>";
-    {
-        // What is electrically on the port, whatever the stack made of it
-        // (1.7.1): separates "the device isn't there" from "the device is
-        // there but failed to enumerate", which used to read the same.
-        String p;
-        UsbMidi::appendPortDiag(p);
-        s += "<tr><td>USB port</td><td>" + htmlEscape(p) + "</td></tr>";
-    }
-    s += "<tr><td>Bridged port</td><td>" + bridgedPortText() + "</td></tr>";
-    s += "<tr><td>USB events</td><td>" + String(snap.usbEvents) + "</td></tr>";
-    s += "<tr><td>USB &rarr; RTP</td><td>" + String(snap.forwarded) + " events in " +
-         String(snap.uplinkPackets) + " packets</td></tr>";
-    s += "<tr><td>RTP &rarr; USB</td><td>" + String(snap.returned) + " events, " +
-         String(snap.txDelivered) + " packets delivered, " + String(snap.txDropped) +
-         " dropped</td></tr>";
-    {
-        String d;
-        UsbMidi::appendRxDiag(d);
-        s += "<tr><td>IN pipeline</td><td>" + htmlEscape(d) + "</td></tr>";
-    }
-    {
-        String d;
-        UsbMidi::appendTxDiag(d);
-        s += "<tr><td>OUT pipeline</td><td>" + htmlEscape(d) + "</td></tr>";
-    }
-    // MIDI task timing (1.8.0): pass = time spent forwarding per wake-up,
-    // period = longest gap between wake-ups, which is the added latency.
-    s += "<tr><td>MIDI task</td><td>pass max " + String(snap.passMaxUs) + " us, mean " +
-         String(snap.passMeanUs) + " us, period max " + String(snap.periodMaxUs) +
-         " us, stack free " + String(snap.stackFree) + " B</td></tr>";
-    s += "<tr><td>Uptime</td><td>" + String(millis() / 1000) + " s</td></tr>";
-    s += "<tr><td>Free heap</td><td>" + String(ESP.getFreeHeap() / 1024) + " kB (lowest " +
-         String(ESP.getMinFreeHeap() / 1024) + " kB)</td></tr>";
-    s += F("</table>");
-    // The log rings are long and only wanted when something is being diagnosed,
-    // so they collapse like the descriptor dump rather than pushing the status
-    // table off the top of the page.
-    if (snap.usbEvents > 0) {
-        String ev;
-        UsbMidi::appendRecentEvents(ev, "\n");
-        s += F("<details class='nets'><summary>Recent MIDI from the device</summary>"
-               "<small>cN = virtual cable (reload to refresh)</small><pre>");
-        s += htmlEscape(ev);
-        s += F("</pre></details>");
-    }
-    if (UsbMidi::txFormattedCount() > 0) {
-        String ev;
-        UsbMidi::appendRecentTxEvents(ev, "\n");
-        s += F("<details class='nets'><summary>Recent MIDI to the device</summary><pre>");
-        s += htmlEscape(ev);
-        s += F("</pre></details>");
-    }
-    {
-        String ev;
-        RtpMidi::appendEventLog(ev, "\n");
-        if (ev.length()) {
-            s += F("<details class='nets'><summary>RTP-MIDI session events</summary><pre>");
-            s += htmlEscape(ev);
-            s += F("</pre></details>");
-        }
-    }
-    {
-        String ev = WifiNet::eventLog();
-        if (ev.length()) {
-            s += F("<details class='nets'><summary>WiFi events</summary><pre>");
-            s += htmlEscape(ev);
-            s += F("</pre></details>");
-        }
-    }
-    if (UsbMidi::stackLogCount() > 0) {
-        String ev;
-        UsbMidi::appendStackLog(ev, "\n");
-        s += F("<details class='nets'><summary>USB host stack errors</summary>"
-               "<small>logged by the ESP-IDF USB driver; E (n) = n ms after boot</small><pre>");
-        s += htmlEscape(ev);
-        s += F("</pre></details>");
-    }
-    {
-        const String desc = UsbMidi::descriptorDump();
-        if (desc.length()) {
-            s += F("<details class='nets'><summary>USB descriptors</summary><pre>");
-            s += htmlEscape(desc);
-            s += F("</pre></details>");
-        }
-    }
-    return s;
-}
-
-String htmlEscape(const String& in) {
-    String out;
-    out.reserve(in.length());
-    for (size_t i = 0; i < in.length(); i++) {
-        switch (in[i]) {
-            case '&': out += F("&amp;"); break;
-            case '<': out += F("&lt;"); break;
-            case '>': out += F("&gt;"); break;
-            case '\'': out += F("&#39;"); break;
-            case '"': out += F("&quot;"); break;
-            default: out += in[i];
-        }
-    }
-    return out;
-}
-
-// Serves the previous async scan's results, and kicks off a fresh scan ONLY
-// when that is safe. Rendered as clickable chips that fill the SSID input -- a
-// <datalist> gets suppressed by browser password managers on forms that contain
-// password fields.
-//
-// A scan is not free: the station leaves its home channel and hops the band for
-// seconds, during which MIDI in BOTH directions stalls. Measured 2026-07-28 --
-// merely VIEWING this page mid-session was enough to disturb the stream, and a
-// host that watchdogs the link can drop the session over it. So the scan is
-// started only when no RTP-MIDI peer is connected (setup time -- the only time
-// the list is actually wanted), or when the operator explicitly asks with
-// ?scan=1 and accepts the glitch.
-String ssidChips(bool allowScan) {
-    String out;
-    int n = WiFi.scanComplete();
-    if (n > 0) {
-        int order[64];
-        if (n > 64) n = 64;
-        for (int i = 0; i < n; i++) order[i] = i;
-        for (int i = 1; i < n; i++) {  // insertion sort by RSSI, strongest first
-            int k = order[i], j = i - 1;
-            while (j >= 0 && WiFi.RSSI(order[j]) < WiFi.RSSI(k)) {
-                order[j + 1] = order[j];
-                j--;
-            }
-            order[j + 1] = k;
-        }
-        String rows;
-        int count = 0;
-        for (int i = 0; i < n; i++) {
-            String s = WiFi.SSID(order[i]);
-            if (!s.length()) continue;
-            String esc = htmlEscape(s);
-            if (rows.indexOf("'>" + esc + "</td>") >= 0) continue;  // dedupe
-            rows += "<tr onclick=\"document.forms[0].ssid.value=this.dataset.s\" data-s='" + esc +
-                    "'><td class='net'>" + esc + "</td><td class='rssi'>" +
-                    String(WiFi.RSSI(order[i])) + " dBm</td></tr>";
-            count++;
-        }
-        out += F("<details class='nets'><summary>Available networks (");
-        out += String(count);
-        out += F(")</summary><table>");
-        out += rows;
-        out += F("</table></details>");
-    } else if (n == 0 && allowScan) {
-        out = F("<p><small>No networks found yet -- reload to rescan.</small></p>");
-    } else if (allowScan) {
-        out = F("<p><small>Scanning for networks... reload in a few seconds.</small></p>");
-    }
-    if (!allowScan) {
-        out += F("<p><small>Network scanning is paused while a MIDI session is "
-                 "active -- a scan takes the radio off-channel for seconds and "
-                 "would interrupt the stream. "
-                 "<a href='/?scan=1'>Scan anyway</a> (expect a brief dropout), or "
-                 "just type the SSID above.</small></p>");
-        return out;
-    }
-    if (n >= 0) WiFi.scanDelete();
-    WiFi.scanNetworks(true);
-    return out;
-}
-
-// One <option> per MIDIStreaming interface the attached device presents, plus
-// "auto". Alternate settings of the same interface collapse into one row --
-// the firmware picks whichever alt actually carries endpoints.
-String usbIfaceOptions(uint8_t sel) {
-    String o = F("<option value='255'");
-    if (sel == Config::IFACE_AUTO) o += F(" selected");
-    o += F(">Auto &mdash; first MIDI interface the device offers</option>");
-    uint32_t listed = 0;  // interface numbers already emitted
-    UsbMidi::IfaceInfo f;
-    for (uint8_t i = 0; i < UsbMidi::ifaceCount(); i++) {
-        if (!UsbMidi::ifaceAt(i, f)) continue;
-        if (!f.epIn && !f.epOut) continue;  // alt setting with no endpoints
-        if (f.num < 32) {
-            if (listed & (1UL << f.num)) continue;
-            listed |= 1UL << f.num;
-        }
-        o += "<option value='" + String(f.num) + "'";
-        if (sel == f.num) o += F(" selected");
-        o += ">Interface " + String(f.num) + F(" &mdash; ");
-        // A device that omits the class-specific descriptor still has cable 0.
-        o += f.epIn ? String(f.inCables ? f.inCables : 1) + " in" : String("no input");
-        o += ", ";
-        o += f.epOut ? String(f.outCables ? f.outCables : 1) + " out" : String("no output");
-        o += F("</option>");
-    }
-    if (sel != Config::IFACE_AUTO && !(sel < 32 && (listed & (1UL << sel)))) {
-        // A stored selection stays visible even with its device unplugged --
-        // otherwise re-saving the form would silently discard it.
-        o += "<option value='" + String(sel) + "' selected>Interface " + String(sel) +
-             F(" &mdash; not present on the attached device</option>");
-    }
-    return o;
-}
-
-// All 16 cables are always offered: descriptors are not always honest about
-// how many a device has, so observed traffic is annotated alongside the
-// declared count and the user can pick any of them. The declared count is read
-// per direction -- a device's in and out cable counts are independent, which is
-// the whole reason the output port is its own setting.
-String usbCableOptions(uint8_t sel, bool output, const MidiTask::Snapshot& snap) {
-    UsbMidi::IfaceInfo f;
-    uint8_t declared = 0;
-    if (UsbMidi::claimedInterfaceInfo(f)) declared = output ? f.outCables : f.inCables;
-    String o;
-    if (output) {
-        o = F("<option value='254'");
-        if (sel == Config::CABLE_SAME) o += F(" selected");
-        o += F(">Same as the port above</option>");
-    } else {
-        o = F("<option value='255'");
-        if (sel == Config::CABLE_ALL) o += F(" selected");
-        o += F(">All ports, merged into one stream</option>");
-    }
-    for (uint8_t c = 0; c < 16; c++) {
-        o += "<option value='" + String(c) + "'";
-        if (sel == c) o += F(" selected");
-        o += ">Port " + String(c + 1) + " (cable " + String(c) + ")";
-        if (declared && c < declared) o += F(" &mdash; on the device");
-        if (!output) {  // inbound traffic is evidence; outbound is our own doing
-            uint32_t seen = snap.cableRx[c];
-            if (seen) o += " &mdash; " + String(seen) + " events seen";
-        }
-        o += F("</option>");
-    }
-    return o;
-}
-
-void handleRoot() {
-    if (!authOk()) return server.requestAuthentication();
-    const Config::Values& c = Config::get();
-    MidiTask::Snapshot snap;
-    MidiTask::snapshot(snap);
-    String page;
-    // Reserve the whole page up front (1.5.4, bridge audit F-12). The page is
-    // ~14 kB built by dozens of String += appends, and every append that
-    // outgrows the buffer reallocs and copies the whole page so far: quadratic
-    // heap churn that also fragments the heap. One reservation removes
-    // essentially all of it. Until 1.8.0 this ran in the same loop that pumped
-    // MIDI, which waited out the whole build and TCP send; the MIDI task now
-    // preempts it. What a load still costs is airtime on a board whose supply
-    // limits transmit, so do not add an auto-refresh here.
-    page.reserve(16384);
-    page += FPSTR(PAGE_HEAD);
-    page += statusSection();
-    page += F("<h2>Configuration</h2><form method='POST' action='/config' autocomplete='off'>"
-              "<label>WiFi SSID <small>(type, or pick from available networks below)</small></label>"
-              "<input type='text' name='ssid' autocomplete='off' value='");
-    page += htmlEscape(c.wifiSsid);
-    page += F("'>");
-    // Safe to scan when nothing is listening to us, or when explicitly asked.
-    page += ssidChips(!RtpMidi::hasPeer() || server.arg("scan") == "1");
-    page += F("<label>WiFi password <small>(leave blank to keep current)</small></label>"
-              "<input type='password' name='pass' value=''>"
-              "<label>RTP-MIDI session name</label><input type='text' name='name' maxlength='24' value='");
-    // Escaped like every other stored value (1.7.2): raw, a name with an
-    // apostrophe closed the attribute early -- the form showed it cut short,
-    // and the next save stored the cut -- and markup in either field ran as
-    // script on every page load.
-    page += htmlEscape(c.sessionName);
-    page += F("'><label>Connect to peer (IP, blank = accept incoming only)</label>"
-              "<input type='text' name='tip' value='");
-    page += htmlEscape(c.targetIp);
-    page += F("'><label>Peer port</label><input type='number' name='tport' min='1' max='65535' value='");
-    page += String(c.targetPort);
-    page += F("'>"
-              "<label>USB MIDI interface <small>(which MIDI function of the device to "
-              "claim)</small></label><select name='uif'>");
-    page += usbIfaceOptions(c.usbIface);
-    page += F("</select>"
-              "<label>USB MIDI port, device &rarr; network <small>(a device's virtual "
-              "cables are the ports a DAW would list)</small></label><select name='ucab'>");
-    page += usbCableOptions(c.usbCable, false, snap);
-    page += F("</select>"
-              "<label>USB MIDI port, network &rarr; device <small>(leave on \"same as "
-              "above\" unless the device is asymmetric)</small></label>"
-              "<select name='ucabo'>");
-    page += usbCableOptions(c.usbCableOut, true, snap);
-    page += F("</select><p><small>Currently bridging ");
-    page += bridgedPortText();
-    page += F(". RTP-MIDI carries no port number, so one port is bridged per direction, "
-              "normally the same one &mdash; a control surface expects its LEDs back on the "
-              "port it sent from. \"All ports\" merges every incoming port; with it the "
-              "return path has no port to follow, so pick one explicitly. Plug the device "
-              "in and reload to see which ports it presents and which are carrying "
-              "traffic.</small></p>");
-    {
-        String w = portWarning();
-        if (w.length()) {
-            page += F("<p><small class='warn'>");
-            page += w;
-            page += F("</small></p>");
-        }
-    }
-    page += F("<label>Static IP <small>(blank = DHCP)</small></label>"
-              "<input type='text' name='sip' value='");
-    page += htmlEscape(c.staticIp);
-    page += F("'><label>Subnet mask</label><input type='text' name='smask' value='");
-    page += htmlEscape(c.staticMask);
-    page += F("'><label>Gateway <small>(blank = none)</small></label>"
-              "<input type='text' name='sgw' value='");
-    page += htmlEscape(c.staticGw);
-    page += F("'><label>DNS server <small>(blank = use gateway)</small></label>"
-              "<input type='text' name='sdns' value='");
-    page += htmlEscape(c.staticDns);
-    page += F("'><p><small class='warn'>A wrong static IP can make the device unreachable "
-              "(no setup-AP fallback once WiFi itself connects). Recovery: hold BOOT for "
-              "10&nbsp;s to factory-reset.</small></p>"
-              "<label>WiFi TX power</label><select name='txp'>");
-    for (uint8_t choice : Config::TX_POWER_CHOICES) {
-        page += "<option value='" + String(choice) + "'";
-        if (c.txPower == choice) page += F(" selected");
-        page += ">" + String(choice / 4.0, 1) + " dBm";
-        if (choice == Config::TX_POWER_DEFAULT) page += F(" (default)");
-        page += F("</option>");
-    }
-    page += F("</select><p><small>Power above ~8.5 dBm has been shown to cause brownouts "
-              "on some ESP32 boards. Use with caution.</small></p>"
-              "<label>Web UI password <small>(");
-    page += c.webPass.length() ? F("set; blank = keep current") : F("not set; blank = stays off");
-    page += F(")</small></label><input type='password' name='webpass' maxlength='63' value=''>"
-              "<label><input type='checkbox' name='clearpass' value='1'> Remove web UI password</label>"
-              // The Reboot button sits beside Save & reboot but must NOT submit
-              // the config form, so it posts to a separate empty form declared
-              // below and reached by its id (HTML5 form=). That keeps the two
-              // buttons in one row without nesting forms, which is invalid.
-              "<div class='btnrow'><button type='submit'>Save &amp; reboot</button>"
-              "<button type='submit' form='rebootform' class='alt'>Reboot</button></div></form>"
-              "<form id='rebootform' method='POST' action='/reboot' "
-              "onsubmit=\"return confirm('Reboot the device now?')\"></form>"
-              "<p><small>Reboot restarts the firmware without touching any settings; "
-              "the MIDI session drops and re-establishes.</small></p>"
-              "<h2>Firmware update</h2>"
-              "<form method='POST' action='/update' enctype='multipart/form-data'>"
-              "<input type='file' name='fw' accept='.bin'>"
-              "<button type='submit'>Upload &amp; flash</button></form>"
-              "<h2>Factory reset</h2>"
-              "<form method='POST' action='/reset' "
-              "onsubmit=\"return confirm('Erase all settings and reboot?')\">"
-              "<button type='submit'>Reset to defaults</button></form>"
-              "<p><small>Also available without the password: hold the BOOT button "
-              "for 10 seconds.</small></p>"
-              "<p><small>Device reboots after saving config, flashing firmware, or resetting.</small></p>"
-              "<div class='foot'>Author: Jon Sands &mdash; "
-              "<a href='https://github.com/Fohdeesha/ESP32-MIDI-WIFI'>"
-              "github.com/Fohdeesha/ESP32-MIDI-WIFI</a></div>"
-              "</body></html>");
-    server.send(200, "text/html", page);
 }
 
 // Valid dotted-quad IPv4, e.g. "192.168.1.81". IPAddress::fromString alone
@@ -581,6 +140,562 @@ bool refuseCrossOrigin() {
     return false;
 }
 
+// Gate for the /api/* reads: auth, exactly as the page itself had until 1.9.0.
+// No Host check here, deliberately: the old page showed status and settings
+// at whatever name the device was reached by (a router's DNS name included),
+// and these carry no secret -- passwords only ever appear as "set or not".
+// Everything that changes state still needs an IP or the .local name
+// (refuseCrossOrigin).
+bool apiAllowed() {
+    if (!authOk()) {
+        server.requestAuthentication();
+        return false;
+    }
+    // Every /api/* answer is live data: never cached, never sniffed as HTML.
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("X-Content-Type-Options", "nosniff");
+    return true;
+}
+
+// Strict UTF-8, as a browser decodes it (no overlong forms, no surrogates).
+// The page is UTF-8; a stored name in some other encoding -- typed into a
+// pre-1.9.0 page, which declared no charset, or a router's legacy-encoded
+// SSID -- would reach it as U+FFFD and be saved back that way.
+bool validUtf8(const char* s) {
+    const uint8_t* p = (const uint8_t*)s;
+    while (*p) {
+        const uint8_t c = *p;
+        if (c < 0x80) {
+            p++;
+            continue;
+        }
+        int n;
+        uint32_t cp;
+        if ((c & 0xE0) == 0xC0) {
+            n = 1;
+            cp = c & 0x1F;
+        } else if ((c & 0xF0) == 0xE0) {
+            n = 2;
+            cp = c & 0x0F;
+        } else if ((c & 0xF8) == 0xF0) {
+            n = 3;
+            cp = c & 0x07;
+        } else {
+            return false;
+        }
+        for (int i = 1; i <= n; i++) {
+            if ((p[i] & 0xC0) != 0x80) return false;  // also stops at the terminator
+            cp = cp << 6 | (p[i] & 0x3F);
+        }
+        const uint32_t min = n == 1 ? 0x80 : n == 2 ? 0x800 : 0x10000;
+        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+        p += n + 1;
+    }
+    return true;
+}
+
+void appendHex(String& out, const String& s) {
+    static const char HEX_DIGITS[] = "0123456789abcdef";
+    for (size_t i = 0; i < s.length(); i++) {
+        const uint8_t b = (uint8_t)s[i];
+        out += HEX_DIGITS[b >> 4];
+        out += HEX_DIGITS[b & 0x0F];
+    }
+}
+
+// The exact bytes of an SSID sent as hex (see handleConfigPost). False on
+// anything but 1-32 bytes of hex with no NUL.
+bool ssidFromHex(const String& hex, String& out) {
+    if (hex.length() < 2 || hex.length() > 64 || hex.length() % 2) return false;
+    String s;
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        int v = 0;
+        for (size_t k = i; k < i + 2; k++) {
+            const char ch = hex[k];
+            const int d = ch >= '0' && ch <= '9'   ? ch - '0'
+                          : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                          : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10
+                                                   : -1;
+            if (d < 0) return false;
+            v = v << 4 | d;
+        }
+        if (v == 0) return false;
+        s += (char)v;
+    }
+    out = s;
+    return true;
+}
+
+// One JSON document built into a fixed buffer, with commas placed
+// automatically. A document that does not fit is reported (ok() == false),
+// never sent cut short. Strings are escaped for JSON and additionally for
+// HTML (<, >, &), so even a mis-sniffed response could not carry markup.
+class Json {
+public:
+    Json(char* buf, size_t cap) : b_(buf), cap_(cap) { b_[0] = '\0'; }
+    void open() { sep(); put('{'); comma_ = false; }
+    void close() { put('}'); comma_ = true; }
+    void openArr() { sep(); put('['); comma_ = false; }
+    void closeArr() { put(']'); comma_ = true; }
+    void key(const char* k) { sep(); quoted(k); put(':'); comma_ = false; }
+    void str(const char* s) { sep(); quoted(s); comma_ = true; }
+    void str(const String& s) { str(s.c_str()); }
+    void num(long v) {
+        char t[16];
+        snprintf(t, sizeof(t), "%ld", v);
+        sep();
+        raw(t);
+        comma_ = true;
+    }
+    void unum(uint32_t v) {
+        char t[16];
+        snprintf(t, sizeof(t), "%lu", (unsigned long)v);
+        sep();
+        raw(t);
+        comma_ = true;
+    }
+    void boolean(bool v) { sep(); raw(v ? "true" : "false"); comma_ = true; }
+    bool ok() const { return !full_; }
+    size_t length() const { return n_; }
+    size_t room() const { return cap_ - n_; }
+    const char* c_str() const { return b_; }
+
+private:
+    void put(char c) {
+        if (n_ + 1 < cap_) {
+            b_[n_++] = c;
+            b_[n_] = '\0';
+        } else {
+            full_ = true;
+        }
+    }
+    void raw(const char* s) {
+        while (*s) put(*s++);
+    }
+    void sep() {
+        if (comma_) put(',');
+    }
+    void quoted(const char* s) {
+        put('"');
+        for (; *s; s++) {
+            const uint8_t c = (uint8_t)*s;
+            if (c == '"' || c == '\\') {
+                put('\\');
+                put((char)c);
+            } else if (c < 0x20 || c == 0x7F || c == '<' || c == '>' || c == '&') {
+                char t[8];
+                snprintf(t, sizeof(t), "\\u%04x", c);
+                raw(t);
+            } else {
+                // Bytes >= 0x80 pass as they are. A name that is not valid
+                // UTF-8 decodes to U+FFFD in the browser; the JSON stays valid.
+                put((char)c);
+            }
+        }
+        put('"');
+    }
+    char* b_;
+    size_t cap_;
+    size_t n_ = 0;
+    bool comma_ = false;
+    bool full_ = false;
+};
+
+// Shared by every JSON handler: they all run in the loop task, one request at
+// a time. Static rather than on that task's 8 kB stack.
+char s_json[6144];
+
+void sendJson(const Json& j) {
+    if (!j.ok()) {
+        server.send(500, "text/plain", "response too large");
+        return;
+    }
+    // send_P takes a pointer and a length: on this chip that is any memory,
+    // and it spares a String copy of the whole document.
+    server.send_P(200, "application/json", j.c_str(), j.length());
+}
+
+// Cables are numbered 0-15 on the wire but every host UI labels the same
+// things "port 1..16", so the page shows both and never just one.
+String portLabel(uint8_t cable) {
+    return "port " + String(cable + 1) + " (cable " + String(cable) + ")";
+}
+
+String bridgedPortText() {
+    uint8_t in = MidiBridge::bridgedCable();
+    String s = in == Config::CABLE_ALL ? String("all ports merged") : portLabel(in);
+    return s + " in, " + portLabel(MidiBridge::outputCable()) + " out";
+}
+
+// Flags a selection pointing at a cable the attached device doesn't declare in
+// that direction -- the asymmetric case (a device's in and out cable counts are
+// independent) that would otherwise be silently dead in one direction.
+String portWarning() {
+    UsbMidi::IfaceInfo f;
+    if (!UsbMidi::claimedInterfaceInfo(f)) return String();
+    String w;
+    uint8_t in = MidiBridge::bridgedCable();
+    uint8_t out = MidiBridge::outputCable();
+    if (f.inCables && in != Config::CABLE_ALL && in >= f.inCables) {
+        w += "The device declares only " + String(f.inCables) +
+             " port(s) toward the network, so nothing will arrive on " + portLabel(in) + ". ";
+    }
+    if (f.outCables && out >= f.outCables) {
+        w += "The device declares only " + String(f.outCables) +
+             " port(s) from the network, so anything sent to " + portLabel(out) +
+             " will be ignored. ";
+    }
+    return w;
+}
+
+void formatMac(char* out, size_t len, esp_mac_type_t type) {
+    uint8_t m[6] = {};
+    esp_read_mac(m, type);
+    snprintf(out, len, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+// The station MAC is what the router sees (DHCP reservations, client lists).
+// While the setup AP is up, phones see the AP's own, one higher.
+String macText() {
+    char sta[18], ap[18];
+    formatMac(sta, sizeof(sta), ESP_MAC_WIFI_STA);
+    String s(sta);
+    if (WifiNet::portalActive()) {
+        formatMac(ap, sizeof(ap), ESP_MAC_WIFI_SOFTAP);
+        s += " (setup AP ";
+        s += ap;
+        s += ")";
+    }
+    return s;
+}
+
+// The page: static, gzipped, from flash. no-cache makes the browser revalidate
+// on every load, and the ETag (a hash of the page) turns that into a 304, so a
+// reload costs a few hundred bytes of airtime instead of the whole page.
+void handleRoot() {
+    if (!authOk()) return server.requestAuthentication();
+    const bool gz = server.header("Accept-Encoding").indexOf("gzip") >= 0;
+    const char* etag = gz ? WEB_PAGE_ETAG_GZ : WEB_PAGE_ETAG_RAW;
+    server.sendHeader("Cache-Control", "private, no-cache");
+    server.sendHeader("ETag", etag);
+    server.sendHeader("Vary", "Accept-Encoding");
+    if (server.header("If-None-Match").indexOf(etag) >= 0) {
+        server.send(304, "text/html", "");
+        return;
+    }
+    if (gz) {
+        server.sendHeader("Content-Encoding", "gzip");
+        server.send_P(200, "text/html; charset=utf-8", (PGM_P)WEB_PAGE_GZ, WEB_PAGE_GZ_LEN);
+    } else {
+        server.send_P(200, "text/html; charset=utf-8", (PGM_P)WEB_PAGE_RAW, WEB_PAGE_RAW_LEN);
+    }
+}
+
+// The status table, as the text each row shows, plus a version per log so the
+// page fetches a log only while it is open and only when it changed (0 =
+// empty, and the page hides it). The page polls this every 2 s while it is
+// visible: ~1.5 kB a time. That used to be ruled out because a page load
+// stalled MIDI; since 1.8.0 the MIDI task preempts this, and what is left is
+// airtime, about one more small TCP exchange than the heartbeat alone sends.
+void handleApiStatus() {
+    if (!apiAllowed()) return;
+    MidiTask::Snapshot snap;
+    MidiTask::snapshot(snap);
+    const Config::Values& c = Config::get();
+    char t[160];
+    Json j(s_json, sizeof(s_json));
+    j.open();
+    j.key("rows");
+    j.open();
+    j.key("fw");
+    j.str("v" FW_VERSION);
+    j.key("ip");
+    j.str(WiFi.localIP().toString() + (WifiNet::usingStaticIp() ? " (static)" : " (DHCP)"));
+    j.key("mac");
+    j.str(macText());
+    snprintf(t, sizeof(t), "%d dBm (TX %.1f dBm)", (int)WiFi.RSSI(), c.txPower / 4.0);
+    j.key("rssi");
+    j.str(t);
+    {
+        // WiFi health (1.7.0): a dropout used to be invisible here -- the page
+        // read "good RSSI" while the device had been off the network for
+        // minutes. Disconnect count + last reason + reset reason answer the
+        // "why did it drop?" question from the device itself.
+        String w;
+        WifiNet::appendDiag(w);
+        j.key("wifi");
+        j.str(w);
+    }
+    {
+        String peers = String(snap.peerCount);
+        if (c.targetIp.length() && snap.peerCount == 0) {
+            peers += " (inviting " + c.targetIp + ":" + String(c.targetPort) + ")";
+        }
+        const int named = snap.peerCount < RtpMidi::MAX_PEERS ? snap.peerCount : RtpMidi::MAX_PEERS;
+        for (int i = 0; i < named; i++) {
+            peers += i ? ", " : " (";
+            peers += snap.peerNames[i];
+        }
+        if (named > 0) peers += ")";
+        j.key("peers");
+        j.str(peers);
+    }
+    j.key("usb");
+    j.str(UsbMidi::statusText());
+    {
+        // What is electrically on the port, whatever the stack made of it
+        // (1.7.1): separates "the device isn't there" from "the device is
+        // there but failed to enumerate", which used to read the same.
+        String p;
+        UsbMidi::appendPortDiag(p);
+        j.key("port");
+        j.str(p);
+    }
+    j.key("bridged");
+    j.str(bridgedPortText());
+    j.key("events");
+    j.unum(snap.usbEvents);
+    snprintf(t, sizeof(t), "%lu events in %lu packets", (unsigned long)snap.forwarded,
+             (unsigned long)snap.uplinkPackets);
+    j.key("up");
+    j.str(t);
+    snprintf(t, sizeof(t), "%lu events, %lu packets delivered, %lu dropped",
+             (unsigned long)snap.returned, (unsigned long)snap.txDelivered,
+             (unsigned long)snap.txDropped);
+    j.key("down");
+    j.str(t);
+    {
+        String d;
+        UsbMidi::appendRxDiag(d);
+        j.key("in");
+        j.str(d);
+    }
+    {
+        String d;
+        UsbMidi::appendTxDiag(d);
+        j.key("out");
+        j.str(d);
+    }
+    // MIDI task timing (1.8.0): pass = time spent forwarding per wake-up,
+    // period = longest gap between wake-ups, which is the added latency.
+    snprintf(t, sizeof(t), "pass max %lu us, mean %lu us, period max %lu us, stack free %lu B",
+             (unsigned long)snap.passMaxUs, (unsigned long)snap.passMeanUs,
+             (unsigned long)snap.periodMaxUs, (unsigned long)snap.stackFree);
+    j.key("task");
+    j.str(t);
+    snprintf(t, sizeof(t), "%lu s", (unsigned long)(millis() / 1000));
+    j.key("uptime");
+    j.str(t);
+    snprintf(t, sizeof(t), "%lu kB (lowest %lu kB)", (unsigned long)(ESP.getFreeHeap() / 1024),
+             (unsigned long)(ESP.getMinFreeHeap() / 1024));
+    j.key("heap");
+    j.str(t);
+    j.close();
+    // The logs are long and only wanted when something is being diagnosed,
+    // so they stay collapsed under the table and load when opened.
+    j.key("logs");
+    j.open();
+    j.key("usb_in");
+    j.unum(snap.usbEvents);
+    j.key("usb_out");
+    j.unum(UsbMidi::txFormattedCount());
+    j.key("session");
+    j.unum(RtpMidi::eventLogVersion());
+    j.key("wifi");
+    j.unum(WifiNet::eventCount());
+    j.key("stack");
+    j.unum(UsbMidi::stackLogCount());
+    j.key("desc");
+    j.unum(UsbMidi::descriptorVersion());
+    j.close();
+    j.close();
+    sendJson(j);
+}
+
+// The settings as stored, minus the secrets (the passwords are only "set or
+// not"), plus what the port selects need: every MIDIStreaming interface on the
+// attached device, the claimed one's declared cable counts per direction, and
+// the traffic actually seen per cable -- descriptors are not always honest.
+void handleApiConfig() {
+    if (!apiAllowed()) return;
+    const Config::Values& c = Config::get();
+    MidiTask::Snapshot snap;
+    MidiTask::snapshot(snap);
+    Json j(s_json, sizeof(s_json));
+    j.open();
+    j.key("ssid");
+    j.str(c.wifiSsid);
+    j.key("name");
+    j.str(c.sessionName);
+    j.key("tip");
+    j.str(c.targetIp);
+    j.key("tport");
+    j.unum(c.targetPort);
+    j.key("sip");
+    j.str(c.staticIp);
+    j.key("smask");
+    j.str(c.staticMask);
+    j.key("sgw");
+    j.str(c.staticGw);
+    j.key("sdns");
+    j.str(c.staticDns);
+    j.key("uif");
+    j.unum(c.usbIface);
+    j.key("ucab");
+    j.unum(c.usbCable);
+    j.key("ucabo");
+    j.unum(c.usbCableOut);
+    j.key("txp");
+    j.unum(c.txPower);
+    j.key("txChoices");
+    j.openArr();
+    for (uint8_t choice : Config::TX_POWER_CHOICES) j.unum(choice);
+    j.closeArr();
+    j.key("txDefault");
+    j.unum(Config::TX_POWER_DEFAULT);
+    j.key("webPassSet");
+    j.boolean(c.webPass.length() > 0);
+    // A name that is not valid UTF-8 cannot round-trip through the page; it
+    // leaves that field blank instead, and a blank field keeps what is stored.
+    j.key("ssidOk");
+    j.boolean(validUtf8(c.wifiSsid.c_str()));
+    j.key("nameOk");
+    j.boolean(validUtf8(c.sessionName.c_str()));
+    // [bInterfaceNumber, has IN, has OUT, IN cables, OUT cables], one row per
+    // alternate setting; the page collapses them.
+    j.key("ifaces");
+    j.openArr();
+    UsbMidi::IfaceInfo f;
+    for (uint8_t i = 0; i < UsbMidi::ifaceCount(); i++) {
+        if (!UsbMidi::ifaceAt(i, f)) continue;
+        j.openArr();
+        j.unum(f.num);
+        j.unum(f.epIn ? 1 : 0);
+        j.unum(f.epOut ? 1 : 0);
+        j.unum(f.inCables);
+        j.unum(f.outCables);
+        j.closeArr();
+    }
+    j.closeArr();
+    const bool claimed = UsbMidi::claimedInterfaceInfo(f);
+    j.key("declIn");
+    j.unum(claimed ? f.inCables : 0);
+    j.key("declOut");
+    j.unum(claimed ? f.outCables : 0);
+    j.key("cableRx");
+    j.openArr();
+    for (uint8_t n = 0; n < 16; n++) j.unum(snap.cableRx[n]);
+    j.closeArr();
+    j.key("bridging");
+    j.str(bridgedPortText());
+    j.key("warning");
+    j.str(portWarning());
+    j.close();
+    sendJson(j);
+}
+
+// One diagnostic log as plain text, fetched when the page opens it.
+void handleApiLog() {
+    if (!apiAllowed()) return;
+    const String name = server.arg("name");
+    String out;
+    if (name == "usb_in") {
+        UsbMidi::appendRecentEvents(out, "\n");
+    } else if (name == "usb_out") {
+        UsbMidi::appendRecentTxEvents(out, "\n");
+    } else if (name == "session") {
+        RtpMidi::appendEventLog(out, "\n");
+    } else if (name == "wifi") {
+        out = WifiNet::eventLog();
+    } else if (name == "stack") {
+        UsbMidi::appendStackLog(out, "\n");
+    } else if (name == "desc") {
+        out = UsbMidi::descriptorDump();
+    } else {
+        server.send(404, "text/plain", "no such log");
+        return;
+    }
+    server.send(200, "text/plain; charset=utf-8", out);
+}
+
+// The last scan's results, strongest first, one row per SSID. Never starts a
+// scan: a GET is what the page polls.
+void handleApiScanGet() {
+    if (!apiAllowed()) return;
+    int n = WiFi.scanComplete();
+    Json j(s_json, sizeof(s_json));
+    j.open();
+    // >= 0 networks found, -1 scanning, -2 none yet or failed -- or a scan
+    // past the core's 6 s limit, whose results can still arrive (the page
+    // keeps asking).
+    j.key("state");
+    j.num(n);
+    j.key("peer");
+    j.boolean(RtpMidi::hasPeer());
+    j.key("nets");
+    j.openArr();
+    if (n > 0) {
+        int order[64];
+        if (n > 64) n = 64;
+        for (int i = 0; i < n; i++) order[i] = i;
+        for (int i = 1; i < n; i++) {  // insertion sort by RSSI, strongest first
+            int k = order[i], m = i - 1;
+            while (m >= 0 && WiFi.RSSI(order[m]) < WiFi.RSSI(k)) {
+                order[m + 1] = order[m];
+                m--;
+            }
+            order[m + 1] = k;
+        }
+        for (int i = 0; i < n; i++) {
+            const String ssid = WiFi.SSID(order[i]);
+            if (!ssid.length()) continue;  // hidden network
+            bool dup = false;              // keep the strongest of each name
+            for (int p = 0; p < i && !dup; p++) dup = WiFi.SSID(order[p]) == ssid;
+            if (dup) continue;
+            // A 32-byte SSID escapes to at most ~200 bytes, plus 64 of hex;
+            // stop short of the end rather than send a broken document.
+            if (j.room() < 320) break;
+            j.openArr();
+            j.str(ssid);
+            j.num(WiFi.RSSI(order[i]));
+            if (!validUtf8(ssid.c_str())) {
+                // [name, rssi, hex]: the page cannot send these bytes back
+                // through its UTF-8 form, so it posts the hex (ssidhex).
+                String hex;
+                appendHex(hex, ssid);
+                j.str(hex);
+            }
+            j.closeArr();
+        }
+    }
+    j.closeArr();
+    j.close();
+    sendJson(j);
+}
+
+// Starts an async scan. A scan is not free: the station leaves its home channel
+// and hops the band for seconds, during which MIDI in BOTH directions stalls.
+// Measured 2026-07-28 -- merely viewing the page mid-session was enough to
+// disturb the stream, and a host that watchdogs the link can drop the session
+// over it. So it is refused (409) while an RTP-MIDI peer is connected, unless
+// the operator explicitly asks with force=1 ("Scan anyway") and accepts the
+// glitch. With no peer -- setup time, when the list is actually wanted -- the
+// page starts one on every load.
+void handleApiScanPost() {
+    if (!authOk()) return server.requestAuthentication();
+    if (refuseCrossOrigin()) return;
+    if (RtpMidi::hasPeer() && server.arg("force") != "1") {
+        server.send(409, "text/plain",
+                    "A MIDI session is active and a scan would interrupt it; "
+                    "add force=1 to scan anyway.");
+        return;
+    }
+    const int n = WiFi.scanComplete();
+    if (n >= 0) WiFi.scanDelete();
+    if (n != WIFI_SCAN_RUNNING) WiFi.scanNetworks(true);
+    server.send(202, "text/plain", "scanning\n");
+}
+
 void handleConfigPost() {
     if (!authOk()) return server.requestAuthentication();
     if (refuseCrossOrigin()) return;
@@ -590,7 +705,15 @@ void handleConfigPost() {
     // overflows the Arduino core's own Basic-auth buffer (its length is kept
     // in a char, which is unsigned 8-bit on this chip) on every request after.
     const char* bad = nullptr;
-    const String ssid = server.arg("ssid");
+    String ssid = server.arg("ssid");
+    // A network picked from the scan list whose name is not valid UTF-8 comes
+    // as its exact bytes in hex (1.9.0): the page is UTF-8 and would otherwise
+    // post a mangled name, and the device could never rejoin.
+    if (server.hasArg("ssidhex") && server.arg("ssidhex").length() &&
+        !ssidFromHex(server.arg("ssidhex"), ssid)) {
+        server.send(400, "text/html", "Not saved: invalid WiFi SSID. Go back and correct it.");
+        return;
+    }
     const String pass = server.arg("pass");
     const String name = server.arg("name");
     String tip = server.arg("tip");
@@ -791,13 +914,10 @@ void handleRebootPost() {
     ESP.restart();
 }
 
-// Deliberately NOT part of the status page: that page is ~14 kB assembled by
-// repeated String concatenation, which until 1.8.0 ran in the same task that
-// pumped MIDI, so polling it perturbed exactly the timing a throughput
-// measurement is trying to read. This is a few hundred bytes of plain text,
-// cheap enough to sample once a second during a load ramp without becoming
-// part of the experiment. The counters are single-writer 32-bit values read
-// live rather than from the 100 ms snapshot, since the VM tooling diffs them.
+// Plain text for measurement scripts, a few hundred bytes, cheap enough to
+// sample once a second during a load ramp without becoming part of the
+// experiment. The counters are single-writer 32-bit values read live rather
+// than from the 100 ms snapshot, since the VM tooling diffs them.
 // New keys are only ever appended: that tooling parses these lines.
 void handleDiag() {
     if (!authOk()) return server.requestAuthentication();
@@ -855,6 +975,12 @@ void handleDiag() {
                  (unsigned long)UsbMidi::clientStackFree());
         s += buf;
     }
+    s += "\nmac=";  // 1.9.0, the station MAC
+    {
+        char mac[18];
+        formatMac(mac, sizeof(mac), ESP_MAC_WIFI_STA);
+        s += mac;
+    }
     s += "\n";
     server.send(200, "text/plain", s);
 }
@@ -884,10 +1010,16 @@ void handleResetPost() {
 }  // namespace
 
 void WebUi::begin() {
-    // Authorization is always collected; Origin is what sameOrigin() checks.
-    static const char* HEADERS[] = {"Origin"};
-    server.collectHeaders(HEADERS, 1);
+    // Authorization is always collected. Origin is what sameOrigin() checks;
+    // the other two serve the page (gzip, and the ETag revalidation).
+    static const char* HEADERS[] = {"Origin", "Accept-Encoding", "If-None-Match"};
+    server.collectHeaders(HEADERS, 3);
     server.on("/", HTTP_GET, handleRoot);
+    server.on("/api/status", HTTP_GET, handleApiStatus);
+    server.on("/api/config", HTTP_GET, handleApiConfig);
+    server.on("/api/log", HTTP_GET, handleApiLog);
+    server.on("/api/scan", HTTP_GET, handleApiScanGet);
+    server.on("/api/scan", HTTP_POST, handleApiScanPost);
     server.on("/config", HTTP_POST, handleConfigPost);
     server.on("/update", HTTP_POST, handleUpdatePost, handleUpdateUpload);
     server.on("/reset", HTTP_POST, handleResetPost);

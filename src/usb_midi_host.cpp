@@ -1362,6 +1362,13 @@ String UsbMidi::descriptorDump() {
     return String();
 }
 
+uint32_t UsbMidi::descriptorVersion() {
+    // The generation alone: odd mid-write, so the page sees a change and
+    // fetches again once the writer is done. A torn read of the first byte
+    // only decides whether the log shows for one poll.
+    return s_descDump[0] ? s_descGen : 0;
+}
+
 void UsbMidi::appendRxDiag(String& out) {
     char buf[360];
     // One snapshot each: the count is volatile and an attach on the client

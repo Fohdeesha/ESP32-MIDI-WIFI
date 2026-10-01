@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-MIDI-WIFI</title><style>
+body{font-family:system-ui,sans-serif;max-width:640px;margin:1em auto;padding:0 1em;background:#111;color:#ddd}
+h1{font-size:1.4em;color:#e0453a}h2{font-size:1.05em;margin-top:1.6em;border-bottom:1px solid #333;padding-bottom:.3em}
+table{border-collapse:collapse}td{padding:.15em .8em .15em 0;color:#aaa}td+td{color:#ddd}
+label{display:block;margin:.7em 0 .2em;color:#aaa}
+input[type=text],input[type=password],input[type=number],select{width:100%;box-sizing:border-box;padding:.45em;background:#222;border:1px solid #444;border-radius:4px;color:#ddd}
+/* White on #e0453a is 4.1:1 -- AA only as large text, hence 1.2em/700. */
+button{margin-top:1em;padding:.5em 1.4em;background:#e0453a;border:0;border-radius:4px;color:#fff;font-size:1.2em;font-weight:700;cursor:pointer}
+button:hover{background:#f2564a}button:active{background:#c53a30}
+/* Secondary action sharing a row with a primary one (#ddd on #333 is 9.2:1). */
+button.alt{background:#333;color:#ddd}button.alt:hover{background:#444}button.alt:active{background:#2a2a2a}
+.btnrow{display:flex;gap:.7em;flex-wrap:wrap;align-items:center}
+.warn{color:#fa5}small{color:#888}
+.nets{margin:.5em 0;border:1px solid #333;border-radius:4px;padding:.2em .6em}
+.nets summary{cursor:pointer;color:#8cf;padding:.3em 0}
+.nets table{width:100%;border-collapse:collapse;margin:.2em 0 .4em}
+.nets tr{cursor:pointer}
+.nets tr:hover td{background:#222}
+.nets td{padding:.35em .6em;border-bottom:1px solid #2a2a2a;color:#ddd}
+.nets td.rssi{text-align:right;color:#888;white-space:nowrap;width:6em}
+.nets pre{font-size:1em;line-height:1.35;margin:.4em 0 .6em;overflow-x:auto}
+.nets small{display:block;margin:.3em 0 .1em}
+.foot{margin-top:2.2em;border-top:1px solid #333;padding-top:.8em;color:#888;font-size:.9em}
+.foot a{color:#e0453a;text-decoration:none}.foot a:hover{text-decoration:underline}
+</style></head><body><h1>ESP32-MIDI-WIFI</h1>
+<p id='err' class='warn' hidden></p>
+<h2>Status</h2><table id='st'>
+<tr><td>Firmware</td><td id='s-fw'></td></tr>
+<tr><td>IP</td><td id='s-ip'></td></tr>
+<tr><td>MAC</td><td id='s-mac'></td></tr>
+<tr><td>RSSI</td><td id='s-rssi'></td></tr>
+<tr><td>WiFi health</td><td id='s-wifi'></td></tr>
+<tr><td>RTP-MIDI peers</td><td id='s-peers'></td></tr>
+<tr><td>USB MIDI</td><td id='s-usb'></td></tr>
+<tr><td>USB port</td><td id='s-port'></td></tr>
+<tr><td>Bridged port</td><td id='s-bridged'></td></tr>
+<tr><td>USB events</td><td id='s-events'></td></tr>
+<tr><td>USB &rarr; RTP</td><td id='s-up'></td></tr>
+<tr><td>RTP &rarr; USB</td><td id='s-down'></td></tr>
+<tr><td>IN pipeline</td><td id='s-in'></td></tr>
+<tr><td>OUT pipeline</td><td id='s-out'></td></tr>
+<tr><td>MIDI task</td><td id='s-task'></td></tr>
+<tr><td>Uptime</td><td id='s-uptime'></td></tr>
+<tr><td>Free heap</td><td id='s-heap'></td></tr>
+</table>
+<details class='nets' id='l-usb_in' hidden><summary>Recent MIDI from the device</summary><small>cN = virtual cable (updates live)</small><pre></pre></details>
+<details class='nets' id='l-usb_out' hidden><summary>Recent MIDI to the device</summary><pre></pre></details>
+<details class='nets' id='l-session' hidden><summary>RTP-MIDI session events</summary><pre></pre></details>
+<details class='nets' id='l-wifi' hidden><summary>WiFi events</summary><pre></pre></details>
+<details class='nets' id='l-stack' hidden><summary>USB host stack errors</summary><small>logged by the ESP-IDF USB driver; E (n) = n ms after boot</small><pre></pre></details>
+<details class='nets' id='l-desc' hidden><summary>USB descriptors</summary><pre></pre></details>
+<h2>Configuration</h2><form method='POST' action='/config' autocomplete='off'>
+<label>WiFi SSID <small>(type, or pick from available networks below)</small></label><input type='text' name='ssid' autocomplete='off' value=''><input type='hidden' name='ssidhex' value='' disabled>
+<div id='nets'></div>
+<p id='n-none' hidden><small>No networks found yet -- reload to rescan.</small></p>
+<p id='n-busy' hidden><small>Scanning for networks...</small></p>
+<p id='n-paused' hidden><small>Network scanning is paused while a MIDI session is active -- a scan takes the radio off-channel for seconds and would interrupt the stream. <a href='/?scan=1'>Scan anyway</a> (expect a brief dropout), or just type the SSID above.</small></p>
+<label>WiFi password <small>(leave blank to keep current)</small></label><input type='password' name='pass' value=''>
+<label>RTP-MIDI session name</label><input type='text' name='name' maxlength='24' value=''>
+<label>Connect to peer (IP, blank = accept incoming only)</label><input type='text' name='tip' value=''>
+<label>Peer port</label><input type='number' name='tport' min='1' max='65535' value=''>
+<label>USB MIDI interface <small>(which MIDI function of the device to claim)</small></label><select name='uif'></select>
+<label>USB MIDI port, device &rarr; network <small>(a device's virtual cables are the ports a DAW would list)</small></label><select name='ucab'></select>
+<label>USB MIDI port, network &rarr; device <small>(leave on "same as above" unless the device is asymmetric)</small></label><select name='ucabo'></select>
+<p><small>Currently bridging <span id='c-bridging'></span>. RTP-MIDI carries no port number, so one port is bridged per direction, normally the same one &mdash; a control surface expects its LEDs back on the port it sent from. "All ports" merges every incoming port; with it the return path has no port to follow, so pick one explicitly. Plug the device in and reload to see which ports it presents and which are carrying traffic.</small></p>
+<p id='c-warn' hidden><small class='warn'></small></p>
+<label>Static IP <small>(blank = DHCP)</small></label><input type='text' name='sip' value=''>
+<label>Subnet mask</label><input type='text' name='smask' value=''>
+<label>Gateway <small>(blank = none)</small></label><input type='text' name='sgw' value=''>
+<label>DNS server <small>(blank = use gateway)</small></label><input type='text' name='sdns' value=''>
+<p><small class='warn'>A wrong static IP can make the device unreachable (no setup-AP fallback once WiFi itself connects). Recovery: hold BOOT for 10&nbsp;s to factory-reset.</small></p>
+<label>WiFi TX power</label><select name='txp'></select>
+<p><small>Power above ~8.5 dBm has been shown to cause brownouts on some ESP32 boards. Use with caution.</small></p>
+<label>Web UI password <small id='c-wpass'></small></label><input type='password' name='webpass' maxlength='63' value=''>
+<label><input type='checkbox' name='clearpass' value='1'> Remove web UI password</label>
+<!-- The Reboot button sits beside Save & reboot but must NOT submit the config
+form, so it posts to a separate empty form declared below and reached by its id
+(HTML5 form=). That keeps the two buttons in one row without nesting forms,
+which is invalid. -->
+<div class='btnrow'><button type='submit'>Save &amp; reboot</button><button type='submit' form='rebootform' class='alt'>Reboot</button></div></form>
+<form id='rebootform' method='POST' action='/reboot' onsubmit="return confirm('Reboot the device now?')"></form>
+<p><small>Reboot restarts the firmware without touching any settings; the MIDI session drops and re-establishes.</small></p>
+<h2>Firmware update</h2>
+<form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='fw' accept='.bin'><button type='submit'>Upload &amp; flash</button></form>
+<h2>Factory reset</h2>
+<form method='POST' action='/reset' onsubmit="return confirm('Erase all settings and reboot?')"><button type='submit'>Reset to defaults</button></form>
+<p><small>Also available without the password: hold the BOOT button for 10 seconds.</small></p>
+<p><small>Device reboots after saving config, flashing firmware, or resetting.</small></p>
+<div class='foot'>Author: Jon Sands &mdash; <a href='https://github.com/Fohdeesha/ESP32-MIDI-WIFI'>github.com/Fohdeesha/ESP32-MIDI-WIFI</a></div>
+<script>
+"use strict";
+// The page is static; this fills it from the device's JSON (src/web_ui.cpp).
+// Everything goes in through textContent and new Option(), never as markup:
+// session, peer and network names come from users and other devices.
+const $ = id => document.getElementById(id);
+const form = document.forms[0];
+const field = n => form.elements[n];
+const DASH = ' — ';
+let cfgLoaded = false;
+
+// location.origin rather than a relative path: opened as http://user:pass@host/
+// the page would hand fetch() a URL with credentials in it, which fetch refuses.
+async function request(path, opts) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 8000);
+  try {
+    const r = await fetch(location.origin + path,
+                          Object.assign({cache: 'no-store', signal: ctl.signal}, opts));
+    if (!r.ok) {
+      const e = new Error((await r.text()).trim() || 'HTTP ' + r.status);
+      e.status = r.status;
+      throw e;
+    }
+    return r;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const getJson = async path => (await request(path)).json();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// What a failed request should say. A refusal (403) carries its own text.
+function why(e) {
+  if (!e.status) return 'No response from the device. Retrying.';
+  if (e.status === 401) return 'Not logged in. Reload the page.';
+  if (e.status === 403) return e.message;
+  return 'The device answered ' + e.status + ': ' + e.message;
+}
+
+const problems = {};
+function problem(key, msg) {
+  problems[key] = msg;
+  const text = Object.values(problems).filter(Boolean).join(' ');
+  $('err').textContent = text;
+  $('err').hidden = !text;
+}
+
+// --- Status: polled every 2 s while the page is visible ---------------------
+// Each log is fetched only while its <details> is open, and again only when
+// the device reports a new version of it (0 = empty, so hidden).
+let logVer = {};
+const logShown = {}, logSeq = {};
+async function loadLog(name, ver) {
+  const seq = (logSeq[name] || 0) + 1;
+  logSeq[name] = seq;
+  logShown[name] = ver;
+  try {
+    const text = await (await request('/api/log?name=' + name)).text();
+    if (logSeq[name] === seq) $('l-' + name).querySelector('pre').textContent = text;
+  } catch (e) {
+    if (logSeq[name] === seq) logShown[name] = -1;  // try again next poll
+  }
+}
+document.querySelectorAll('details[id^="l-"]').forEach(d => d.addEventListener('toggle', () => {
+  const name = d.id.slice(2);
+  if (d.open && logVer[name] !== logShown[name]) loadLog(name, logVer[name]);
+}));
+
+async function poll() {
+  let s;
+  try {
+    s = await getJson('/api/status');
+  } catch (e) {
+    $('st').style.opacity = '.5';
+    problem('status', why(e));
+    return;
+  }
+  $('st').style.opacity = '';
+  problem('status', '');
+  for (const k in s.rows) {
+    const cell = $('s-' + k);
+    if (cell) cell.textContent = s.rows[k];
+  }
+  logVer = s.logs;
+  for (const k in s.logs) {
+    const d = $('l-' + k);
+    if (!d) continue;
+    d.hidden = !s.logs[k];
+    if (d.open && s.logs[k] !== logShown[k]) loadLog(k, s.logs[k]);
+  }
+}
+
+let pollTimer = 0, polling = false;
+async function tick() {
+  clearTimeout(pollTimer);
+  pollTimer = 0;
+  if (polling) return;
+  polling = true;
+  try {
+    await poll();
+  } finally {
+    polling = false;
+  }
+  if (document.visibilityState === 'visible') pollTimer = setTimeout(tick, 2000);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') {
+    clearTimeout(pollTimer);
+    pollTimer = 0;
+  } else if (!polling && !pollTimer) {
+    tick();
+  }
+});
+
+// --- Configuration form ------------------------------------------------------
+function fillSelect(sel, opts, value) {
+  sel.textContent = '';
+  for (const [v, label] of opts) sel.add(new Option(label, v, v === value, v === value));
+}
+
+// One option per MIDIStreaming interface plus "auto". Alternate settings of
+// one interface collapse into one row: the firmware picks whichever alt
+// actually carries endpoints. ifaces rows: [num, hasIn, hasOut, inCables, outCables].
+function ifaceOptions(c) {
+  const opts = [[255, 'Auto' + DASH + 'first MIDI interface the device offers']];
+  const listed = new Set();
+  for (const [num, hasIn, hasOut, inCables, outCables] of c.ifaces) {
+    if ((!hasIn && !hasOut) || listed.has(num)) continue;
+    listed.add(num);
+    // A device that omits the class-specific descriptor still has cable 0.
+    opts.push([num, 'Interface ' + num + DASH +
+               (hasIn ? (inCables || 1) + ' in' : 'no input') + ', ' +
+               (hasOut ? (outCables || 1) + ' out' : 'no output')]);
+  }
+  // A stored selection stays visible even with its device unplugged --
+  // otherwise re-saving the form would silently discard it.
+  if (c.uif !== 255 && !listed.has(c.uif)) {
+    opts.push([c.uif, 'Interface ' + c.uif + DASH + 'not present on the attached device']);
+  }
+  return opts;
+}
+
+// All 16 cables are always offered: descriptors are not always honest, so
+// observed traffic is shown next to the declared count. The declared count is
+// per direction, since a device's in and out cable counts are independent.
+function cableOptions(c, output) {
+  const declared = output ? c.declOut : c.declIn;
+  const opts = [output ? [254, 'Same as the port above']
+                       : [255, 'All ports, merged into one stream']];
+  for (let n = 0; n < 16; n++) {
+    let label = 'Port ' + (n + 1) + ' (cable ' + n + ')';
+    if (declared && n < declared) label += DASH + 'on the device';
+    // Inbound traffic is evidence; outbound is our own doing.
+    if (!output && c.cableRx[n]) label += DASH + c.cableRx[n] + ' events seen';
+    opts.push([n, label]);
+  }
+  return opts;
+}
+
+async function loadConfig() {
+  let c;
+  try {
+    c = await getJson('/api/config');
+  } catch (e) {
+    problem('config', 'Settings could not be loaded. ' + why(e) + ' Reload before saving.');
+    return;
+  }
+  problem('config', '');
+  // Only fields still as the page arrived: whatever was typed meanwhile stays.
+  for (const n of ['ssid', 'name', 'tip', 'tport', 'sip', 'smask', 'sgw', 'sdns']) {
+    const f = field(n);
+    if (f.value === f.defaultValue) f.value = c[n];
+  }
+  // A stored name that is not valid UTF-8 would come back mangled and be saved
+  // that way, so it is left out; a blank SSID or session name keeps the stored one.
+  for (const [n, ok] of [['ssid', c.ssidOk], ['name', c.nameOk]]) {
+    if (ok) continue;
+    const f = field(n);
+    if (f.value === c[n]) f.value = '';
+    f.placeholder = 'unchanged (the stored name is not UTF-8 text, so it is not shown)';
+  }
+  fillSelect(field('uif'), ifaceOptions(c), c.uif);
+  fillSelect(field('ucab'), cableOptions(c, false), c.ucab);
+  fillSelect(field('ucabo'), cableOptions(c, true), c.ucabo);
+  fillSelect(field('txp'), c.txChoices.map(v => [v, (v / 4).toFixed(1) + ' dBm' +
+                                                    (v === c.txDefault ? ' (default)' : '')]),
+             c.txp);
+  $('c-wpass').textContent = c.webPassSet ? '(set; blank = keep current)'
+                                          : '(not set; blank = stays off)';
+  $('c-bridging').textContent = c.bridging;
+  $('c-warn').firstChild.textContent = c.warning;
+  $('c-warn').hidden = !c.warning;
+  cfgLoaded = true;
+}
+
+// Saving before the settings arrived would post blank fields, and a blank
+// static IP or peer IP is a valid value (DHCP, listen only).
+form.addEventListener('submit', e => {
+  if (!cfgLoaded) {
+    e.preventDefault();
+    alert('The current settings have not loaded, so saving now would replace them ' +
+          'with blanks. Reload the page and try again.');
+  }
+});
+
+// --- Network list --------------------------------------------------------------
+// A scan takes the station off its channel for seconds, stalling MIDI in both
+// directions, so the device refuses one while a session is up (409) unless
+// the operator asks for it with "Scan anyway" (?scan=1).
+function showNets(s, allowed) {
+  const box = $('nets');
+  const wasOpen = !!box.querySelector('details[open]');
+  box.textContent = '';
+  if (s.state > 0) {
+    const d = document.createElement('details');
+    d.className = 'nets';
+    d.open = wasOpen;
+    const sum = document.createElement('summary');
+    sum.textContent = 'Available networks (' + s.nets.length + ')';
+    const table = document.createElement('table');
+    for (const [ssid, rssi, hex] of s.nets) {
+      const tr = table.insertRow();
+      const name = tr.insertCell(), level = tr.insertCell();
+      name.className = 'net';
+      name.textContent = ssid;
+      level.className = 'rssi';
+      level.textContent = rssi + ' dBm';
+      tr.onclick = () => {
+        field('ssid').value = ssid;
+        // A name that is not UTF-8 goes to the device as its exact bytes.
+        field('ssidhex').value = hex || '';
+        field('ssidhex').disabled = !hex;
+      };
+    }
+    d.append(sum, table);
+    box.append(d);
+  }
+  $('n-none').hidden = !(allowed && s.state === 0);
+  $('n-busy').hidden = !(allowed && s.state < 0);
+  $('n-paused').hidden = allowed;
+}
+
+// Typing a name by hand drops a network picked from the list.
+field('ssid').addEventListener('input', () => {
+  field('ssidhex').value = '';
+  field('ssidhex').disabled = true;
+});
+
+async function scan() {
+  const force = new URLSearchParams(location.search).get('scan') === '1';
+  let s = await getJson('/api/scan');
+  const allowed = !s.peer || force;
+  showNets(s, allowed);
+  if (!allowed) return;
+  // The previous list stays up until the new one is in.
+  try {
+    await request('/api/scan' + (force ? '?force=1' : ''), {method: 'POST'});
+  } catch (e) {
+    if (e.status === 409) showNets(s, false);  // a session came up meanwhile
+    else if (s.state <= 0) showNets({state: 0, nets: []}, true);
+    return;
+  }
+  if (s.state <= 0) showNets({state: -1, nets: []}, true);
+  // Keep asking through -2 as well: the core gives an async scan 6 s and then
+  // reports it failed, but with the station or the setup AP holding a channel
+  // the radio keeps going back to it, a scan runs longer, and the results
+  // still arrive (measured: 26 networks, a second after the "failure"). A
+  // request can fail too while the radio is away; keep asking through that.
+  for (let i = 0; i < 20; i++) {
+    await sleep(1000);
+    try {
+      s = await getJson('/api/scan');
+    } catch (e) {
+      continue;
+    }
+    if (s.state >= 0) break;
+  }
+  // Nothing in time: "No networks found yet -- reload to rescan."
+  showNets(s.state >= 0 ? s : {state: 0, nets: []}, true);
+}
+
+(async () => {
+  // Settings load beside the first status request rather than after it.
+  const first = tick();
+  await loadConfig();
+  await first;
+  try {
+    await scan();
+  } catch (e) {
+    // The list is a convenience; the SSID can always be typed.
+  }
+})();
+</script>
+</body></html>
