@@ -18,7 +18,12 @@ void configure(const char* sessionName, const char* targetIp, uint16_t targetPor
 // Opens the AppleMIDI session listener. WiFi must be connected first.
 void begin();
 bool isStarted();
-void tick();  // pumps incoming RTP-MIDI packets and the invite cycle
+// Pumps incoming RTP-MIDI packets and the invite cycle. Returns how many
+// messages it handled (the MIDI task's timing stats keep the largest).
+int tick();
+// True when the last tick() stopped on its time or count bound with input
+// still waiting (1.9.1): the MIDI task rests a tick before the next one.
+bool backlogged();
 // A single-writer int: safe to read from any task.
 bool hasPeer();
 int peerCount();

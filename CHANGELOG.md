@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.9.1
+
+- A burst of MIDI from the network, like a control surface's full refresh or
+  a SysEx dump, could lose its last packets. The network stack only holds 6
+  waiting packets, so incoming packets now go straight into a deep queue.
+- A long burst no longer holds up MIDI going the other way. It is worked
+  through in 5 ms slices; one pass used to take up to 70 ms.
+- MIDI from the network is handled as soon as it arrives instead of on the
+  next 1 ms poll, and polling no longer costs anything when idle.
+- `/diag` shows where MIDI time goes per stage, the receive queue
+  (`rtp_rx=`), `wakes_net=`, and the receive task's stack.
+
 ## 1.9.0
 
 - The web page is now a static file that loads its data as JSON, so the device

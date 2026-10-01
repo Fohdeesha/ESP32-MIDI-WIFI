@@ -4,6 +4,7 @@
 #include <AppleMIDI.h>
 #include <WiFi.h>
 
+#include "buffered_udp.h"
 #include "log_queue.h"
 #include "midi_bridge.h"
 
@@ -28,11 +29,11 @@
 // that way swallowed the slow trickle of session commands (CK1 answers, invite
 // OKs) for minutes: sessions died with MaxAttempts /
 // NoResponseFromConnectionRequest over and over until reboot -- the exact
-// wedge a busy MIDI host's display load exposed. WiFiUDP hands over at most
-// 1460 bytes of a datagram (it truncates anything longer), so 2048 always
-// holds one whole, and the patched library parses each datagram on its own
-// and drops whatever it leaves (1.7.2): a bad or truncated datagram costs only
-// its own contents.
+// wedge a busy MIDI host's display load exposed. The socket hands over at most
+// 1472 bytes of a datagram (BufferedUDP, 1.9.1; 1460 under WiFiUDP before), so
+// 2048 always holds one whole, and the patched library parses each datagram on
+// its own and drops whatever it leaves (1.7.2): a bad or truncated datagram
+// costs only its own contents.
 //
 // CK_MaxTimeOut: a session the DAW opened is ended (BY sent, surface blanked)
 // after this long without a clock-sync exchange from it. The protocol has the
@@ -44,7 +45,10 @@ struct EspMidiSettings : public APPLEMIDI_NAMESPACE::DefaultSettings {
     static const size_t MaxBufferSize = 2048;
     static const unsigned long CK_MaxTimeOut = 150000;
 };
-using EspMidiSession = APPLEMIDI_NAMESPACE::AppleMIDISession<WiFiUDP, EspMidiSettings>;
+// On BufferedUDP rather than WiFiUDP (1.9.1): lwIP holds only 6 datagrams per
+// socket, and a burst beyond that was dropped while the bridge worked through
+// the first ones (see buffered_udp.h).
+using EspMidiSession = APPLEMIDI_NAMESPACE::AppleMIDISession<BufferedUDP, EspMidiSettings>;
 EspMidiSession AppleMIDI("ESP32-MIDI", 5004);
 
 // A bridge must be byte-transparent: what arrives on one side has to leave on
@@ -81,6 +85,7 @@ static_assert(RtpMidi::PEER_NAME_LEN == EspMidiSettings::MaxSessionNameLen,
 namespace {
 bool started = false;
 uint32_t s_lastInviteMs = 0;
+bool s_backlog = false;  // the last drain stopped with input still waiting
 
 // The settings the session needs, copied once by configure() (see the header).
 char s_name[RtpMidi::PEER_NAME_LEN + 1] = "ESP32-MIDI";
@@ -310,8 +315,8 @@ bool RtpMidi::isStarted() {
     return started;
 }
 
-void RtpMidi::tick() {
-    if (!started) return;
+int RtpMidi::tick() {
+    if (!started) return 0;
     // Drain every pending message, not one per loop: the AppleMIDI library's
     // available() returns early while its parsed-message buffer is non-empty,
     // skipping socket reads AND initiator clock-sync management on that path.
@@ -327,10 +332,35 @@ void RtpMidi::tick() {
     // session upkeep skipped for all of them. Stop when the session has no
     // buffered input instead; available() is exactly what read() would call
     // next, so asking it costs nothing a further read wouldn't.
-    for (int i = 0; i < 128; i++) {
-        if (!MIDI.read() && AppleMIDI.available() == 0) break;
+    //
+    // Bounded by time as well as count (1.9.1). A session start brings the
+    // host's whole surface resync at once, and draining it in one go held a
+    // pass for ~44 ms while USB->RTP waited behind it. Past DRAIN_BUDGET_US
+    // the rest waits for the next pass, at most a millisecond away. Until it
+    // is drained the library skips its socket reads and clock-sync upkeep, as
+    // above; a few 1 ms passes of that is harmless next to session timeouts
+    // measured in seconds. The check comes after a message, so one large
+    // SysEx piece can run the pass a little over. Whatever arrives meanwhile
+    // waits in BufferedUDP's queue, which its own task fills (see
+    // buffered_udp.h), so a long drain no longer costs the tail of a burst.
+    constexpr uint32_t DRAIN_BUDGET_US = 5000;
+    const uint32_t startUs = micros();
+    int handled = 0;
+    s_backlog = true;  // until the drain finds nothing left
+    while (handled < 128) {
+        if (!MIDI.read() && AppleMIDI.available() == 0) {
+            s_backlog = false;
+            break;
+        }
+        handled++;
+        if (micros() - startUs >= DRAIN_BUDGET_US) break;
     }
     inviteTick();
+    return handled;
+}
+
+bool RtpMidi::backlogged() {
+    return started && s_backlog;
 }
 
 bool RtpMidi::hasPeer() {

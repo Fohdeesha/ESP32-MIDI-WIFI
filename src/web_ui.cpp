@@ -6,6 +6,7 @@
 #include <esp_mac.h>
 
 #include "boot_guard.h"
+#include "buffered_udp.h"
 #include "config.h"
 #include "log_queue.h"
 #include "midi_bridge.h"
@@ -959,20 +960,27 @@ void handleDiag() {
         // never in midi_task=.
         MidiTask::Snapshot snap;
         MidiTask::snapshot(snap);
-        // Worst case ~260 bytes with every counter at 10 digits.
-        char buf[320];
+        // Worst case ~410 bytes with every counter at 10 digits. The 1.9.1
+        // keys end their lines: existing keys keep their place.
+        char buf[512];
         snprintf(buf, sizeof(buf),
                  "\nmidi_task=pass_max_us=%lu pass_mean_us=%lu period_max_us=%lu "
-                 "wakes_usb=%lu wakes_timer=%lu stack_free=%lu"
+                 "wakes_usb=%lu wakes_timer=%lu stack_free=%lu rtp_max_us=%lu "
+                 "bridge_max_us=%lu health_max_us=%lu rtp_msgs_max=%lu pass_max_at_s=%lu "
+                 "wakes_net=%lu"
                  "\nloop=period_max_us=%lu\nlog_drops=%lu\nheap_min=%lu"
-                 "\nstacks=loop=%lu usbh_client=%lu",
+                 "\nstacks=loop=%lu usbh_client=%lu udp_rx=%lu",
                  (unsigned long)snap.passMaxUs, (unsigned long)snap.passMeanUs,
                  (unsigned long)snap.periodMaxUs, (unsigned long)snap.wakesUsb,
                  (unsigned long)snap.wakesTimer, (unsigned long)snap.stackFree,
+                 (unsigned long)snap.rtpMaxUs, (unsigned long)snap.bridgeMaxUs,
+                 (unsigned long)snap.healthMaxUs, (unsigned long)snap.rtpMsgsMax,
+                 (unsigned long)(snap.passMaxAtMs / 1000), (unsigned long)snap.wakesNet,
                  (unsigned long)BootGuard::loopPeriodMaxUs(),
                  (unsigned long)LogQueue::drops(), (unsigned long)ESP.getMinFreeHeap(),
                  (unsigned long)uxTaskGetStackHighWaterMark(nullptr),
-                 (unsigned long)UsbMidi::clientStackFree());
+                 (unsigned long)UsbMidi::clientStackFree(),
+                 (unsigned long)BufferedUDP::taskStackFree());
         s += buf;
     }
     s += "\nmac=";  // 1.9.0, the station MAC
@@ -980,6 +988,18 @@ void handleDiag() {
         char mac[18];
         formatMac(mac, sizeof(mac), ESP_MAC_WIFI_STA);
         s += mac;
+    }
+    {
+        // 1.9.1: the RTP-MIDI receive queues (buffered_udp.h). full= counts
+        // times one was full with datagrams still waiting in lwIP, which
+        // drops past 6 of them; it should stay 0. task=0 means the receive
+        // task never started and the MIDI task polls instead.
+        char buf[112];
+        snprintf(buf, sizeof(buf), "\nrtp_rx=queued_max=%lu full=%lu slots=%lu psram=%d task=%d",
+                 (unsigned long)BufferedUDP::queuedMax(), (unsigned long)BufferedUDP::fullCount(),
+                 (unsigned long)BufferedUDP::slotsEach(), BufferedUDP::inPsram() ? 1 : 0,
+                 BufferedUDP::taskRunning() ? 1 : 0);
+        s += buf;
     }
     s += "\n";
     server.send(200, "text/plain", s);

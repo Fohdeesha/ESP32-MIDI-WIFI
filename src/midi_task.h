@@ -48,8 +48,16 @@ struct Snapshot {
     uint32_t passMeanUs;
     uint32_t periodMaxUs;  // longest gap from one pass start to the next
     uint32_t wakesUsb;     // passes started by USB input
+    uint32_t wakesNet;     // ...by a datagram (1.9.1)
     uint32_t wakesTimer;   // ...by the 1 ms poll
     uint32_t stackFree;    // bytes, lowest since boot
+    // Where the longest passes go (1.9.1): each stage's own worst time, the
+    // most messages one RTP drain handled, and when the longest pass was.
+    uint32_t rtpMaxUs;     // RtpMidi::tick (network -> USB, session upkeep)
+    uint32_t bridgeMaxUs;  // MidiBridge::tick (USB -> network)
+    uint32_t healthMaxUs;  // MidiBridge::healthTick (heartbeat, markers)
+    uint32_t rtpMsgsMax;
+    uint32_t passMaxAtMs;  // uptime of the longest pass
 };
 
 // Copies the settings the task needs and starts it. Call once, at the end of
