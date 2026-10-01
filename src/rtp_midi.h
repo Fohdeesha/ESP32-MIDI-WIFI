@@ -21,8 +21,9 @@ bool isStarted();
 // Pumps incoming RTP-MIDI packets and the invite cycle. Returns how many
 // messages it handled (the MIDI task's timing stats keep the largest).
 int tick();
-// True when the last tick() stopped on its time or count bound with input
-// still waiting (1.9.1): the MIDI task rests a tick before the next one.
+// True when the last tick() stopped on its time or count bound rather than
+// on finding nothing left (1.9.1), so input may still be waiting: the MIDI
+// task rests a tick before the next one.
 bool backlogged();
 // A single-writer int: safe to read from any task.
 bool hasPeer();

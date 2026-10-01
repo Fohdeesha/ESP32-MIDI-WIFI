@@ -92,19 +92,20 @@ void sysexPacket(const uint8_t p[4]) {
 
 // At most this many USB packets per tick(). Everything tick() queues toward
 // the peer between two RtpMidi::tick() calls leaves as ONE RTP datagram, and
-// WiFiUDP splits anything over 1460 bytes into a truncated packet plus a
-// headerless remainder that no receiver can parse. Per packet at most 5 bytes
+// the UDP transport (WiFiUDP until 1.9.1, BufferedUDP since, which mirrors it)
+// splits anything over 1460 bytes into a truncated packet plus a headerless
+// remainder that no receiver can parse. Per packet at most 5 bytes
 // are queued (3 data bytes, an EOX the device left out, the delta-time byte),
 // plus the SysEx collected over earlier ticks (at most one segment): bounded
 // here however fast the USB client task refills the queue while it drains.
 constexpr int USB_BATCH = 128;
 static_assert(SYSEX_SEG + 1 + USB_BATCH * 5 + 64 <= 1400,
-              "one pass's USB->RTP output must fit one WiFiUDP datagram");
+              "one pass's USB->RTP output must fit one UDP datagram");
 
 bool s_tickPeer = false;  // RtpMidi::hasPeer() as the last tick() saw it
 
 // Uplink pacing (1.7.3). Everything queued in one pass leaves as one datagram,
-// and passes ran ~480 times a second (up to 1000 in the MIDI task, 1.8.0), so
+// and passes ran ~480 times a second (1000 or more in the MIDI task, 1.8.0), so
 // a busy surface (a few faders moving) went out as several hundred small
 // packets a second -- each a burst of transmit current, which counts on a
 // marginal supply. A token bucket now paces the drain: after a quiet spell up
@@ -426,8 +427,9 @@ void MidiBridge::healthTick() {
         s_sxPendLen = 0;
         sysexAbandon();
     }
-    // Attach/detach edges reach the peer immediately; a fresh peer gets the
-    // current state once so it never has to guess.
+    // Attach/detach edges reach the peer immediately; the first peer of a
+    // session gets the current state once so it never has to guess (a second
+    // peer joining it does not).
     if (peer && (dev != s_lastDevState || !s_lastPeerState)) sendDeviceMarker(dev);
     s_lastDevState = dev;
     s_lastPeerState = peer;

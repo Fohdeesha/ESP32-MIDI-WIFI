@@ -3,7 +3,8 @@
 #include <cstdint>
 
 namespace BootGuard {
-// Call FIRST in setup(). Counts this boot if the previous run ended in a crash
+// Call early in setup(), before anything that could crash on a bad image (only
+// Serial and LogQueue come first). Counts this boot if the previous run ended in a crash
 // (panic or watchdog reset); after 3 such boots without a stable run between
 // them, rolls back to the prior OTA slot. Also puts the loop task under the
 // task watchdog (30 s), so a hang ends in a counted reset too.

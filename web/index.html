@@ -1,9 +1,11 @@
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32-MIDI-WIFI</title><style>
-body{font-family:system-ui,sans-serif;max-width:640px;margin:1em auto;padding:0 1em;background:#111;color:#ddd}
+body{font-family:system-ui,sans-serif;max-width:720px;margin:1em auto;padding:0 1em;background:#111;color:#ddd}
 h1{font-size:1.4em;color:#e0453a}h2{font-size:1.05em;margin-top:1.6em;border-bottom:1px solid #333;padding-bottom:.3em}
 table{border-collapse:collapse}td{padding:.15em .8em .15em 0;color:#aaa}td+td{color:#ddd}
+/* Status row titles: one line each, brighter and heavier than the values. */
+#st td:first-child{white-space:nowrap;color:#e6e6e6;font-weight:600}
 label{display:block;margin:.7em 0 .2em;color:#aaa}
 input[type=text],input[type=password],input[type=number],select{width:100%;box-sizing:border-box;padding:.45em;background:#222;border:1px solid #444;border-radius:4px;color:#ddd}
 /* White on #e0453a is 4.1:1 -- AA only as large text, hence 1.2em/700. */
@@ -13,6 +15,8 @@ button:hover{background:#f2564a}button:active{background:#c53a30}
 button.alt{background:#333;color:#ddd}button.alt:hover{background:#444}button.alt:active{background:#2a2a2a}
 .btnrow{display:flex;gap:.7em;flex-wrap:wrap;align-items:center}
 .warn{color:#fa5}small{color:#888}
+/* The browser's default link blue is unreadable on #111. */
+a{color:#8cf}
 .nets{margin:.5em 0;border:1px solid #333;border-radius:4px;padding:.2em .6em}
 .nets summary{cursor:pointer;color:#8cf;padding:.3em 0}
 .nets table{width:100%;border-collapse:collapse;margin:.2em 0 .4em}
@@ -84,10 +88,14 @@ which is invalid. -->
 <p><small>Reboot restarts the firmware without touching any settings; the MIDI session drops and re-establishes.</small></p>
 <h2>Firmware update</h2>
 <form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='fw' accept='.bin'><button type='submit'>Upload &amp; flash</button></form>
+<h2>Config import &amp; export</h2>
+<form id='importform' method='POST' action='/config/import' enctype='multipart/form-data'><input type='file' name='cfg' accept='.json,application/json' required><button type='submit'>Import &amp; reboot</button></form>
+<form method='GET' action='/config/export'><button type='submit' class='alt'>Export settings</button></form>
+<p><small>Export saves every setting to a file, including the WiFi and web UI passwords in plain text. Import loads such a file and reboots; settings the file leaves out stay as they are. A file from another board brings its static IP too, so change <code>sip</code> in it first or both boards will share one address.</small></p>
 <h2>Factory reset</h2>
 <form method='POST' action='/reset' onsubmit="return confirm('Erase all settings and reboot?')"><button type='submit'>Reset to defaults</button></form>
 <p><small>Also available without the password: hold the BOOT button for 10 seconds.</small></p>
-<p><small>Device reboots after saving config, flashing firmware, or resetting.</small></p>
+<p><small>Device reboots after saving config, importing settings, flashing firmware, or resetting.</small></p>
 <div class='foot'>Author: Jon Sands &mdash; <a href='https://github.com/Fohdeesha/ESP32-MIDI-WIFI'>github.com/Fohdeesha/ESP32-MIDI-WIFI</a></div>
 <script>
 "use strict";
@@ -292,6 +300,18 @@ form.addEventListener('submit', e => {
     e.preventDefault();
     alert('The current settings have not loaded, so saving now would replace them ' +
           'with blanks. Reload the page and try again.');
+  }
+});
+
+// The device refuses a settings file over 4 kB; a bigger one is the wrong file,
+// so say so here rather than send it.
+$('importform').addEventListener('submit', e => {
+  const f = e.target.elements.cfg.files[0];
+  if (f && f.size > 4096) {
+    e.preventDefault();
+    alert('"' + f.name + '" is too large to be a settings file. Pick the .json file Export saved.');
+  } else if (!confirm('Replace the settings with the ones in this file and reboot?')) {
+    e.preventDefault();
   }
 });
 

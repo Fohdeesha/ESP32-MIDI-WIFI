@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.10.0
+
+- Settings can be exported to a JSON file and imported again, under the new
+  "Config import & export" section. The file includes the WiFi and web
+  passwords.
+- One bad request, no password needed, could hang the web server, and 30 s
+  later the watchdog rebooted the board. The core's web server is now patched
+  at build time so a request that stalls or trickles is cut off within 20 s.
+- A firmware or settings file that can't be used is refused as soon as that is
+  clear, instead of after the whole upload.
+- A firmware upload sent through another hostname (DNS rebinding) is refused
+  before anything is written. Before, the refusal came after the new image
+  was already set to boot.
+- An invalid peer port is refused instead of silently ignored.
+- The page is a little wider, and the status row titles stay on one line and
+  stand out more.
+
 ## 1.9.1
 
 - A burst of MIDI from the network, like a control surface's full refresh or
@@ -8,7 +25,7 @@
 - A long burst no longer holds up MIDI going the other way. It is worked
   through in 5 ms slices; one pass used to take up to 70 ms.
 - MIDI from the network is handled as soon as it arrives instead of on the
-  next 1 ms poll, and polling no longer costs anything when idle.
+  next 1 ms poll, and the idle poll is much cheaper.
 - `/diag` shows where MIDI time goes per stage, the receive queue
   (`rtp_rx=`), `wakes_net=`, and the receive task's stack.
 

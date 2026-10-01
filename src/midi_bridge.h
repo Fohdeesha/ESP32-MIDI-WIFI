@@ -30,7 +30,8 @@ void tick();
 //     0xFE contract, instead of waiting out a session timeout. The heartbeat
 //     is deliberately derived from device-side evidence only -- this bridge
 //     never asserts liveness it cannot see.
-//   * On a device attach/detach edge (and once at each peer connect), sends a
+//   * On a device attach/detach edge, and when the first peer connects (not
+//     a second one alongside it), sends a
 //     one-shot status marker sysex F0 7D 55 4D 42 <state> F7 (0x7D = the MIDI
 //     educational/private manufacturer ID, "UMB" tag; state 01 = attached,
 //     00 = detached) so a host learns of an unplug immediately.

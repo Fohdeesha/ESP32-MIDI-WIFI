@@ -39,7 +39,7 @@ struct Snapshot {
     uint32_t forwarded;      // USB -> RTP events
     uint32_t uplinkPackets;  // ...and the datagrams they went out in
     uint32_t returned;       // RTP -> USB events
-    uint32_t usbEvents;      // MIDI events received from the device
+    uint32_t usbEvents;      // events from the device, clock and Active Sensing aside
     uint32_t txDelivered;    // packets the device accepted
     uint32_t txDropped;      // packets that never reached it
     uint32_t cableRx[16];    // events per virtual cable, since attach

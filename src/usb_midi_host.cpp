@@ -1370,7 +1370,9 @@ uint32_t UsbMidi::descriptorVersion() {
 }
 
 void UsbMidi::appendRxDiag(String& out) {
-    char buf[360];
+    // Room for every counter at its full 10 digits (1.10.0: 360 could cut
+    // the last fields off after very long uptimes).
+    char buf[448];
     // One snapshot each: the count is volatile and an attach on the client
     // task can zero it between a zero test and the division that trusts it.
     const uint32_t xfers = s_rxXferCount;
@@ -1396,7 +1398,7 @@ void UsbMidi::appendRxDiag(String& out) {
 }
 
 void UsbMidi::appendTxDiag(String& out) {
-    char buf[320];
+    char buf[448];  // as appendRxDiag
     const uint32_t n = s_txXferCount;
     snprintf(buf, sizeof(buf),
              "transfers=%lu pkts=%lu drops=%lu maxpkts=%lu | lat_mean=%lu us "

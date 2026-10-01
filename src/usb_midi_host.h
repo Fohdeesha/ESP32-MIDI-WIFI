@@ -60,7 +60,9 @@ bool deviceConnected();
 // it cannot actually talk to is alive.
 bool healthy();
 String statusText();    // human-readable host state for the web UI (a copy)
-uint32_t eventCount();  // MIDI events received since boot
+// MIDI events received since boot that the recent-events log shows: MIDI
+// clock (F8), Active Sensing (FE) and reserved packets are left out.
+uint32_t eventCount();
 
 // --- MIDI function discovery (1.3.0), for the web UI's port picker ---------
 // Every MIDIStreaming interface found on the last attached device.

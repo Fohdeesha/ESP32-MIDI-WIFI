@@ -22,6 +22,8 @@ both ways, so LEDs, motor faders and displays on control surfaces work too.
 - DHCP or static IP
 - No credentials compiled in; settings live in flash and are set from the web
   page
+- Settings export to a file and import again, to back up a board or set up
+  another one
 
 ## Hardware
 
@@ -67,6 +69,10 @@ Everything else is on the same page: session name, a peer to invite (leave it
 blank to just accept invites), which USB MIDI port to use, static IP, TX power
 and the web password. Saving reboots the board.
 
+Export saves all of it as a JSON file, passwords included, so keep that file
+private. Import loads one back and reboots. Settings a file leaves out keep
+their current values. The keys are the config form's field names.
+
 To wipe all settings (a forgotten password, a bad static IP), hold the BOOT
 button for 10 seconds while it's running.
 
@@ -84,6 +90,10 @@ The build patches the AppleMIDI library first (`tools/patch_applemidi.py`). Its
 only release has a few bugs that matter here, the worst being a debug print on
 every SysEx byte that stalls everything. The script fails the build if the
 library ever changes, so it can't quietly ship unpatched.
+
+It also builds a patched copy of the Arduino core's web server
+(`tools/patch_webserver.py`), which had no time limit on reading a request, so
+one bad request could hang it. The core itself is left alone.
 
 The web page is `web/index.html`. The build gzips it into the firmware
 (`tools/embed_web.py`), and it gets its data from the device as JSON.
