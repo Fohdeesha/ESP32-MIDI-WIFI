@@ -58,7 +58,7 @@ a{color:#8cf}
 <details class='nets' id='l-stack' hidden><summary>USB host stack errors</summary><small>logged by the ESP-IDF USB driver; E (n) = n ms after boot</small><pre></pre></details>
 <details class='nets' id='l-desc' hidden><summary>USB descriptors</summary><pre></pre></details>
 <details class='nets' id='rec'><summary>Flight recorder</summary><small>Every USB MIDI packet in both directions and every session, USB and WiFi event, timed to the microsecond. After a session drop, a heartbeat stop, a USB port reset or a WiFi drop it records 10 s more and then stops, so what led up to it is kept until you re-arm it. Pick those triggers under Configuration.</small>
-<p><a href='/recorder.txt?seconds=60'>Last minute as text</a> &middot; <a href='/api/recorder'>Everything, raw</a> <small>(read it with tools/decode_recorder.py; a download is a lot of WiFi traffic, so not while the bridge is busy)</small></p>
+<p><a href='/recorder.txt?seconds=60'>Last minute as text</a> &middot; <a href='/api/recorder'>Everything, raw</a> <small>(read it with tools/decode_recorder.py. While MIDI is flowing a download slows down to stay out of its way; freeze first to be sure of getting everything.)</small></p>
 <div class='btnrow'><button type='button' class='alt' id='r-freeze'>Freeze now</button><button type='button' class='alt' id='r-arm'>Re-arm</button></div></details>
 <h2>Configuration</h2><form method='POST' action='/config' autocomplete='off'>
 <label>WiFi SSID <small>(type, or pick from available networks below)</small></label><input type='text' name='ssid' autocomplete='off' value=''><input type='hidden' name='ssidhex' value='' disabled>

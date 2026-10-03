@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.11.1
+
+- Downloading the flight recorder no longer disturbs MIDI. While MIDI is
+  flowing a download slows to about 32 kB/s, and when it's quiet it runs at
+  full speed. Before, a download during a busy fader stream made the stream's
+  worst delays a few ms longer.
+- A download runs in the background, so the status page, LED and WiFi keep
+  working while it's in progress. One download at a time.
+- Copying records out for a download blocks the MIDI core for at most about
+  40 µs at a time, down from about 90.
+- `/diag` shows `download=` and `download_paced=` on the `recorder=` line.
+
 ## 1.11.0
 
 - New flight recorder: every USB MIDI packet in both directions and every

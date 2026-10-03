@@ -148,7 +148,9 @@ struct Status {
 void status(Status& out);
 
 // Copies up to max records from seq `from` on into out (keep max small: the
-// copy holds the lock). Records already overwritten are skipped: `lost` says
+// copy holds the lock, with interrupts off on this core, for about 1.2 us a
+// record out of PSRAM; downloads take 16). Records already overwritten are
+// skipped: `lost` says
 // how many, and the copy starts at the oldest one held (from = 0: the oldest,
 // not counted as lost). Returns the count; `next` is the seq to ask for next.
 size_t read(uint64_t from, Rec* out, size_t max, uint64_t& next, uint64_t& lost);

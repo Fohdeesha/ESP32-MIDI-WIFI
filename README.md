@@ -86,6 +86,10 @@ stopping, a USB reset or a WiFi drop it records 10 more seconds and stops, so
 the lead-up is kept until you re-arm it. Download it from the status page;
 `tools/decode_recorder.py` turns the raw file into text.
 
+While MIDI is flowing a download slows itself down so it doesn't get in the
+way. If the recorder is still running under heavy traffic, a slow download can
+fall behind and lose its oldest records, so freeze it first to get everything.
+
 ## Building
 
 You need [PlatformIO](https://platformio.org/).

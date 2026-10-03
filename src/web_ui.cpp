@@ -1538,6 +1538,9 @@ void handleRebootPost() {
 // from the 100 ms snapshot, since the scripts diff them; the midi_task= line
 // is the snapshot's. New keys are only ever appended: the scripts parse
 // these lines.
+bool dlActive();  // the recorder download, further down
+bool dlPaced();
+
 void handleDiag() {
     if (!authOk()) return server.requestAuthentication();
     String s;
@@ -1621,19 +1624,21 @@ void handleDiag() {
     }
     {
         // 1.11.0: the flight recorder. trigger= is what froze it, or is about
-        // to (none while recording normally).
+        // to (none while recording normally). 1.11.1: download= a download is
+        // running, download_paced= it is being paced because MIDI is flowing.
         static const char* const TRIGGER_TOKENS[] = {"none",     "session", "heartbeat",
                                                      "usb_reset", "wifi",   "manual"};
         Recorder::Status st;
         Recorder::status(st);
-        char buf[200];
+        char buf[240];
         snprintf(buf, sizeof(buf),
                  "\nrecorder=seq=%llu oldest=%llu frozen=%d trigger=%s records_per_s=%lu "
-                 "capacity=%lu refused=%lu psram=%d",
+                 "capacity=%lu refused=%lu psram=%d download=%d download_paced=%d",
                  (unsigned long long)st.seq, (unsigned long long)st.oldest, st.frozen ? 1 : 0,
                  st.trigger <= Recorder::TRIG_MANUAL ? TRIGGER_TOKENS[st.trigger] : "?",
                  (unsigned long)st.perSec, (unsigned long)st.capacity,
-                 (unsigned long)st.refused, st.psram ? 1 : 0);
+                 (unsigned long)st.refused, st.psram ? 1 : 0, dlActive() ? 1 : 0,
+                 dlPaced() ? 1 : 0);
         s += buf;
     }
     s += "\n";
@@ -1664,91 +1669,273 @@ void handleResetPost() {
 }
 
 // ── Flight recorder downloads (1.11.0, recorder.h) ──────────────────────────
-// Both stream in chunks from s_json and stop at the record that was newest
-// when the download began, so a ring that keeps recording is not chased. They
-// run in the loop task, which stalls nothing but the web page, WiFi upkeep
-// and the LED -- so not through WebServer's own writes: those wait up to 10 s
-// per call for a client that stopped reading (WiFiClient::write retries a 1 s
-// select ten times, and starts over whenever a byte gets through), which a
-// laptop shut mid-download could repeat past the loop's 30 s watchdog.
-// Download writes straight to the socket: no progress for STALL_MS, or the
-// whole download past MAX_MS, ends it. The chunked encoding is then left
-// unfinished, so the client reports an incomplete download instead of saving
-// a short file as if it were whole.
-class Download {
-public:
-    static constexpr uint32_t STALL_MS = 3000;
-    static constexpr uint32_t MAX_MS = 60000;
+// A download stops at the record that was newest when it began, so a ring that
+// keeps recording is not chased. Since 1.11.1 it is a job that tick() moves
+// along a little on every loop pass, not a loop inside the request, so the
+// page, the LED and WiFi upkeep carry on while it runs. It writes to the
+// socket itself and never waits: WebServer's own writes wait up to 10 s per
+// call for a client that stopped reading. No progress for STALL_MS, or the
+// whole download past MAX_MS, ends it, with the chunked encoding left
+// unfinished so the client reports an incomplete download instead of saving a
+// short file as if it were whole. One at a time.
+//
+// While MIDI is flowing it is paced: one TCP segment at a time, at most
+// BUSY_BYTES_PER_S. On 1.11.0, which sent flat out, a download during a heavy
+// fader stream raised the stream's p99 delay from 14.4 to 16 ms and its worst
+// gap from 22 to 31 ms: MIDI datagrams queued behind the download's segments
+// on the radio, and each copy out of the ring held the recorder's lock, with
+// interrupts off, for up to 88 us. Copies now take 16 records at a time. A
+// paced download of a busy ring that is still recording can fall behind it
+// and lose the oldest records (both formats mark the gap); freeze it first to
+// keep everything.
+namespace dl {
+constexpr uint32_t STALL_MS = 3000;
+constexpr uint32_t MAX_MS = 600000;  // paced, the longest text file (~12 MB) takes ~6 min
+constexpr uint32_t BUSY_BYTES_PER_S = 32768;
+constexpr size_t SEGMENT = 1436;      // lwIP's TCP MSS
+// MIDI is "flowing" when the device sends UP_MIN messages within two samples
+// (someone is playing it; idle, a control surface sends at most 2 in 100 ms)
+// or receives DOWN_MIN or more in DOWN_RUN samples in a row: a steady stream,
+// not the refresh bursts a host sends while idle (measured: 3 samples at most).
+constexpr uint32_t SAMPLE_MS = 50;
+constexpr uint32_t UP_MIN = 3;
+constexpr uint32_t DOWN_MIN = 5;
+constexpr uint8_t DOWN_RUN = 6;
+constexpr uint32_t BUSY_HOLD_MS = 1000;  // paced until this long after the last
+constexpr size_t RECS_PER_READ = 16;  // the lock held ~10 us, at most ~40 (measured)
+constexpr size_t HEAD_ROOM = 8;       // a chunk's size line goes in front of it
+constexpr size_t PAYLOAD = 4096;
 
-    // Sends the status line and headers; the body follows in chunk() calls.
-    Download(const char* type, const char* ext)
-        : client_(server.client()), fd_(client_.fd()), startMs_(millis()) {
-        uint8_t m[6] = {};
-        esp_read_mac(m, ESP_MAC_WIFI_STA);
-        char head[320];
-        const int n = snprintf(head, sizeof(head),
-                               "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
-                               "Content-Disposition: attachment; "
-                               "filename=\"esp32-midi-recorder-%02x%02x%02x.%s\"\r\n"
-                               "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
-                               "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                               type, m[3], m[4], m[5], ext);
-        write(head, n < (int)sizeof(head) ? n : sizeof(head) - 1);
-    }
-    bool ok() const { return ok_; }
-    bool chunk(const char* p, size_t len) {
-        if (!len) return ok_;
-        char size[12];
-        const int n = snprintf(size, sizeof(size), "%x\r\n", (unsigned)len);
-        return write(size, n) && write(p, len) && write("\r\n", 2);
-    }
-    void finish() { write("0\r\n\r\n", 5); }
+bool s_active = false;
+bool s_text = false;
+bool s_fileHeader = false;  // the raw file's 40-byte header is still to go
+bool s_last = false;        // the closing chunk is what is left to send
+WiFiClient s_client;        // keeps the socket ours once the request is done
+int s_fd = -1;
+uint64_t s_next = 0, s_end = 0;  // records still to send, end exclusive
+uint8_t s_header[40];
+uint32_t s_startMs = 0, s_progressMs = 0;
+alignas(8) char s_buf[HEAD_ROOM + PAYLOAD + 2];  // bytes not yet sent: s_off..s_len
+size_t s_off = 0, s_len = 0;
+uint32_t s_tokens = 0, s_tokenUs = 0;  // pacing bucket, in bytes
+uint32_t s_up = 0, s_down = 0, s_upLast = 0, s_seenMs = 0, s_busyMs = 0;
+uint8_t s_downRun = 0;
+bool s_busy = false;
+}  // namespace dl
 
-private:
-    bool write(const char* p, size_t len) {
-        uint32_t last = millis();
-        while (ok_ && len) {
-            const uint32_t now = millis();
-            if (fd_ < 0 || now - startMs_ > MAX_MS || now - last > STALL_MS) {
-                ok_ = false;
-                break;
-            }
-            fd_set w;
-            FD_ZERO(&w);
-            FD_SET(fd_, &w);
-            timeval tv = {0, 50000};
-            const int r = select(fd_ + 1, nullptr, &w, nullptr, &tv);
-            if (r < 0) {
-                ok_ = false;
-                break;
-            }
-            if (r == 0) continue;
-            const int sent = send(fd_, p, len, MSG_DONTWAIT);
-            if (sent < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                ok_ = false;
-                break;
-            }
-            p += sent;
-            len -= sent;
-            last = millis();
-            // Progress, bounded by MAX_MS: past the loop's 30 s only while
-            // the client is actually taking the data.
-            BootGuard::feedWatchdog();
+bool dlActive() {
+    return dl::s_active;
+}
+
+bool dlPaced() {
+    return dl::s_active && dl::s_busy;
+}
+
+void dlEnd(bool complete) {
+    if (!complete) Serial.println("[web] recorder download cut short");
+    dl::s_client = WiFiClient();
+    dl::s_fd = -1;
+    dl::s_active = false;
+}
+
+// Raw records after the file header, read straight into the send buffer.
+size_t dlFillRaw(char* p, size_t room) {
+    size_t used = 0;
+    if (dl::s_fileHeader) {
+        memcpy(p, dl::s_header, sizeof(dl::s_header));
+        used = sizeof(dl::s_header);
+        dl::s_fileHeader = false;
+    }
+    Recorder::Rec* recs = reinterpret_cast<Recorder::Rec*>(p + used);
+    const size_t cap = (room - used) / sizeof(Recorder::Rec);
+    size_t n = 0;
+    while (n < cap && dl::s_next < dl::s_end) {
+        uint64_t after, lost;
+        size_t want = cap - n < dl::RECS_PER_READ ? cap - n : dl::RECS_PER_READ;
+        if (dl::s_end - dl::s_next < want) want = (size_t)(dl::s_end - dl::s_next);
+        size_t got = Recorder::read(dl::s_next, recs + n, want, after, lost);
+        if (!got) {
+            dl::s_next = dl::s_end;
+            break;
         }
-        return ok_;
+        if (after > dl::s_end) {  // overwritten meanwhile: the copy started later
+            const uint64_t extra = after - dl::s_end;
+            got = extra < got ? got - (size_t)extra : 0;
+            after = dl::s_end;
+        }
+        n += got;
+        dl::s_next = after;
     }
-    WiFiClient client_;  // keeps the socket ours while we write to it
-    int fd_;
-    uint32_t startMs_;
-    bool ok_ = true;
-};
+    return used + n * sizeof(Recorder::Rec);
+}
+
+// Lines of text, as tools/decode_recorder.py prints them; 160 bytes is more
+// than any one line takes.
+size_t dlFillText(char* p, size_t room) {
+    size_t used = 0;
+    Recorder::Rec recs[dl::RECS_PER_READ];
+    while (dl::s_next < dl::s_end) {
+        const size_t fit = room - used > 64 ? (room - used - 64) / 160 : 0;  // 64: a "lost" line
+        size_t want = fit < dl::RECS_PER_READ ? fit : dl::RECS_PER_READ;
+        if (dl::s_end - dl::s_next < want) want = (size_t)(dl::s_end - dl::s_next);
+        if (!want) break;
+        uint64_t after, lost;
+        const size_t got = Recorder::read(dl::s_next, recs, want, after, lost);
+        if (!got) {
+            dl::s_next = dl::s_end;
+            break;
+        }
+        if (lost) {
+            used += snprintf(p + used, room - used, "... %llu records lost\n",
+                             (unsigned long long)lost);
+        }
+        const uint64_t first = after - got;
+        for (size_t i = 0; i < got && first + i < dl::s_end; i++) {
+            used += Recorder::format(recs[i], Recorder::fullTime(recs[i], first + i), p + used,
+                                     room - used - 1);
+            p[used++] = '\n';
+        }
+        dl::s_next = after;
+    }
+    return used;
+}
+
+// The next chunk into s_buf, or the closing one once nothing is left.
+void dlRefill() {
+    char* payload = dl::s_buf + dl::HEAD_ROOM;
+    size_t n = 0;
+    if (dl::s_fileHeader || dl::s_next < dl::s_end) {
+        n = dl::s_text ? dlFillText(payload, dl::PAYLOAD) : dlFillRaw(payload, dl::PAYLOAD);
+    }
+    if (!n) {
+        memcpy(dl::s_buf, "0\r\n\r\n", 5);
+        dl::s_off = 0;
+        dl::s_len = 5;
+        dl::s_last = true;
+        return;
+    }
+    char size[dl::HEAD_ROOM + 1];
+    const int h = snprintf(size, sizeof(size), "%x\r\n", (unsigned)n);
+    dl::s_off = dl::HEAD_ROOM - h;
+    memcpy(dl::s_buf + dl::s_off, size, h);
+    memcpy(payload + n, "\r\n", 2);
+    dl::s_len = dl::HEAD_ROOM + n + 2;
+}
+
+// Whether MIDI is flowing (see SAMPLE_MS), or was within BUSY_HOLD_MS. The
+// counters have one writer each, the MIDI task, so they may be read here
+// directly (midi_task.h, rule 2).
+bool dlMidiBusy(uint32_t now) {
+    if (now - dl::s_seenMs >= dl::SAMPLE_MS) {
+        const uint32_t up = MidiBridge::forwardedCount(), down = MidiBridge::returnedCount();
+        const uint32_t upNew = up - dl::s_up;
+        if (down - dl::s_down < dl::DOWN_MIN) {
+            dl::s_downRun = 0;
+        } else if (dl::s_downRun < dl::DOWN_RUN) {
+            dl::s_downRun++;
+        }
+        if (upNew + dl::s_upLast >= dl::UP_MIN || dl::s_downRun >= dl::DOWN_RUN) {
+            dl::s_busy = true;
+            dl::s_busyMs = now;
+        }
+        dl::s_upLast = upNew;
+        dl::s_up = up;
+        dl::s_down = down;
+        dl::s_seenMs = now;
+    }
+    if (dl::s_busy && now - dl::s_busyMs >= dl::BUSY_HOLD_MS) dl::s_busy = false;
+    return dl::s_busy;
+}
+
+// Sends what the socket takes right now, never waiting. Loop task.
+void dlPump() {
+    if (!dl::s_active) return;
+    const uint32_t now = millis();
+    if (dl::s_fd < 0 || now - dl::s_startMs > dl::MAX_MS) return dlEnd(false);
+    const bool busy = dlMidiBusy(now);
+    const uint32_t us = micros();
+    if (busy) {
+        const uint32_t add =
+            (uint32_t)((uint64_t)(us - dl::s_tokenUs) * dl::BUSY_BYTES_PER_S / 1000000);
+        if (add) {
+            dl::s_tokenUs += (uint32_t)((uint64_t)add * 1000000 / dl::BUSY_BYTES_PER_S);
+            dl::s_tokens = dl::s_tokens + add > dl::SEGMENT ? dl::SEGMENT : dl::s_tokens + add;
+        }
+    } else {
+        dl::s_tokens = dl::SEGMENT;  // one segment's worth ready when MIDI starts
+        dl::s_tokenUs = us;
+    }
+    // A few chunks per pass at most, so the loop pass stays short.
+    for (int i = 0; i < 4; i++) {
+        if (dl::s_off == dl::s_len) {
+            if (dl::s_last) return dlEnd(true);
+            dlRefill();
+        }
+        size_t want = dl::s_len - dl::s_off;
+        if (busy) {
+            if (want > dl::SEGMENT) want = dl::SEGMENT;
+            if (dl::s_tokens < want) {
+                dl::s_progressMs = now;  // held back by the pacing, not the client
+                return;
+            }
+        }
+        const int sent = send(dl::s_fd, dl::s_buf + dl::s_off, want, MSG_DONTWAIT);
+        if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return dlEnd(false);
+        if (sent <= 0) {
+            if (now - dl::s_progressMs > dl::STALL_MS) dlEnd(false);
+            return;
+        }
+        dl::s_off += sent;
+        dl::s_progressMs = now;
+        if (busy) {
+            dl::s_tokens -= sent;
+            return;
+        }
+    }
+}
+
+// Takes over the request's connection: the status line and headers go out
+// first, the body follows from dlPump().
+void dlStart(bool text, uint64_t from, uint64_t end) {
+    uint8_t m[6] = {};
+    esp_read_mac(m, ESP_MAC_WIFI_STA);
+    const int n = snprintf(dl::s_buf, sizeof(dl::s_buf),
+                           "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
+                           "Content-Disposition: attachment; "
+                           "filename=\"esp32-midi-recorder-%02x%02x%02x.%s\"\r\n"
+                           "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                           "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                           text ? "text/plain; charset=utf-8" : "application/octet-stream",
+                           m[3], m[4], m[5], text ? "txt" : "bin");
+    dl::s_client = server.client();
+    dl::s_fd = dl::s_client.fd();
+    dl::s_off = 0;
+    dl::s_len = n < (int)sizeof(dl::s_buf) ? n : sizeof(dl::s_buf) - 1;
+    dl::s_text = text;
+    dl::s_fileHeader = !text;
+    dl::s_last = false;
+    dl::s_next = from;
+    dl::s_end = end;
+    const uint32_t now = millis();
+    dl::s_startMs = dl::s_progressMs = now;
+    dl::s_tokens = dl::SEGMENT;
+    dl::s_tokenUs = micros();
+    // Paced until MIDI is seen to be quiet.
+    dl::s_up = MidiBridge::forwardedCount();
+    dl::s_down = MidiBridge::returnedCount();
+    dl::s_upLast = 0;
+    dl::s_downRun = 0;
+    dl::s_seenMs = now;
+    dl::s_busy = true;
+    dl::s_busyMs = now;
+    dl::s_active = true;
+}
 
 // Downloads take the write checks (a Host this device is known by), since a
 // page on another site could otherwise start one with the browser's cached
-// login and spend the radio and the loop task on it. No sendHeader() here:
-// headers queued that way would ride along on the next request's response,
-// as these handlers write their own.
+// login and spend the radio on it. No sendHeader() here: headers queued that
+// way would ride along on the next request's response, as downloads write
+// their own.
 bool downloadAllowed() {
     if (!authOk()) {
         server.requestAuthentication();
@@ -1758,6 +1945,11 @@ bool downloadAllowed() {
         server.send(403, "text/plain",
                     String("Refused: to download the recorder, open this page as http://") +
                         WifiNet::hostname() + ".local/ or by the device's IP address.");
+        return false;
+    }
+    if (dl::s_active) {
+        server.send(503, "text/plain",
+                    "A recorder download is already running. Try again when it is done.");
         return false;
     }
     return true;
@@ -1803,8 +1995,7 @@ void handleRecorderRaw() {
             firstUs = Recorder::fullTime(r, from);
         }
     }
-    Download dl("application/octet-stream", "bin");
-    uint8_t* b = reinterpret_cast<uint8_t*>(s_json);
+    uint8_t* b = dl::s_header;
     const uint32_t version = 1, size = sizeof(Recorder::Rec), first = (uint32_t)from;
     const uint64_t now = esp_timer_get_time();
     memcpy(b, "ESPMREC1", 8);
@@ -1814,33 +2005,7 @@ void handleRecorderRaw() {
     memcpy(b + 20, &st.capacity, 4);
     memcpy(b + 24, &now, 8);
     memcpy(b + 32, &firstUs, 8);
-    dl.chunk(s_json, 40);
-    Recorder::Rec* recs = reinterpret_cast<Recorder::Rec*>(s_json);
-    const size_t cap = sizeof(s_json) / sizeof(Recorder::Rec);
-    uint64_t next = from;
-    while (next < end && dl.ok()) {
-        size_t n = 0;
-        while (n < cap && next < end) {
-            uint64_t after, lost;
-            size_t want = cap - n < 64 ? cap - n : 64;
-            if (end - next < want) want = (size_t)(end - next);
-            size_t got = Recorder::read(next, recs + n, want, after, lost);
-            if (!got) {
-                next = end;
-                break;
-            }
-            if (after > end) {  // overwritten meanwhile: the copy started later
-                const uint64_t extra = after - end;
-                got = extra < got ? got - (size_t)extra : 0;
-                after = end;
-            }
-            n += got;
-            next = after;
-        }
-        if (!n) break;
-        dl.chunk(s_json, n * sizeof(Recorder::Rec));
-    }
-    if (dl.ok()) dl.finish();
+    dlStart(false, from, end);
 }
 
 // The last ?seconds=<n> (1-3600, default 60) as text, one line per record:
@@ -1862,34 +2027,7 @@ void handleRecorderText() {
     const uint64_t startUs = endUs > seconds * 1000000 ? endUs - seconds * 1000000 : 0;
     uint64_t next = Recorder::seqAt(startUs) + 1;
     if (next < st.oldest) next = st.oldest;
-    const uint64_t end = st.seq + 1;
-    Download dl("text/plain; charset=utf-8", "txt");
-    Recorder::Rec recs[32];
-    size_t used = 0;
-    while (next < end && dl.ok()) {
-        uint64_t after, lost;
-        size_t want = end - next < 32 ? (size_t)(end - next) : 32;
-        const size_t got = Recorder::read(next, recs, want, after, lost);
-        if (!got) break;
-        if (lost) {
-            used += snprintf(s_json + used, sizeof(s_json) - used, "... %llu records lost\n",
-                             (unsigned long long)lost);
-        }
-        const uint64_t firstSeq = after - got;
-        for (size_t i = 0; i < got && firstSeq + i < end; i++) {
-            const uint64_t seq = firstSeq + i;
-            used += Recorder::format(recs[i], Recorder::fullTime(recs[i], seq), s_json + used,
-                                     sizeof(s_json) - used - 1);
-            s_json[used++] = '\n';
-            if (used > sizeof(s_json) - 160) {
-                dl.chunk(s_json, used);
-                used = 0;
-            }
-        }
-        next = after;
-    }
-    dl.chunk(s_json, used);
-    if (dl.ok()) dl.finish();
+    dlStart(true, next, st.seq + 1);
 }
 
 void handleRecorderArm() {
@@ -1976,4 +2114,5 @@ void WebUi::tick() {
         const uint32_t us = micros() - startUs;
         Recorder::put(Recorder::WEB, s_webPath, &us, 4);
     }
+    dlPump();  // a recorder download in progress (1.11.1)
 }
